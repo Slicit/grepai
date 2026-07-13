@@ -69,7 +69,7 @@ func TestOpenAIEmbedder_RetryAfterHeader(t *testing.T) {
 		},
 	}
 
-	_, err = emb.EmbedBatches(context.Background(), batches, nil)
+	_, err = emb.EmbedBatches(context.Background(), batches, nil, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestOpenAIEmbedder_RetryAfterFallback(t *testing.T) {
 		},
 	}
 
-	_, err = emb.EmbedBatches(context.Background(), batches, nil)
+	_, err = emb.EmbedBatches(context.Background(), batches, nil, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestOpenAIEmbedder_InvalidRetryAfter(t *testing.T) {
 		},
 	}
 
-	_, err = emb.EmbedBatches(context.Background(), batches, nil)
+	_, err = emb.EmbedBatches(context.Background(), batches, nil, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestOpenAIEmbedder_AdaptiveParallelismReduction(t *testing.T) {
 		},
 	}
 
-	_, err = emb.EmbedBatches(context.Background(), batches, nil)
+	_, err = emb.EmbedBatches(context.Background(), batches, nil, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestOpenAIEmbedder_TokenPacing(t *testing.T) {
 		{Index: 1, Entries: []embedder.BatchEntry{{FileIndex: 0, ChunkIndex: 1, Content: "test text batch 2"}}},
 	}
 
-	_, err = emb.EmbedBatches(context.Background(), batches, nil)
+	_, err = emb.EmbedBatches(context.Background(), batches, nil, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestOpenAIEmbedder_NoTokenPacingWhenDisabled(t *testing.T) {
 		{Index: 0, Entries: []embedder.BatchEntry{{FileIndex: 0, ChunkIndex: 0, Content: "test text"}}},
 	}
 
-	_, err = emb.EmbedBatches(context.Background(), batches, nil)
+	_, err = emb.EmbedBatches(context.Background(), batches, nil, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -433,7 +433,7 @@ func TestOpenAIEmbedder_BatchProgressCallback(t *testing.T) {
 		},
 	}
 
-	_, err = emb.EmbedBatches(context.Background(), batches, progress)
+	_, err = emb.EmbedBatches(context.Background(), batches, progress, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
