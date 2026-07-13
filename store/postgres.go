@@ -258,6 +258,36 @@ func (s *PostgresStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return paths, rows.Err()
 }
 
+// GetAllDocuments returns every document for this project in a single
+// query, instead of the one-round-trip-per-path cost of calling GetDocument
+// in a loop. This is the dominant win when restarting `grepai watch` against
+// a project that is already fully indexed: deciding "does anything need
+// re-indexing" no longer costs one network round trip per file.
+func (s *PostgresStore) GetAllDocuments(ctx context.Context) (map[string]*Document, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT path, hash, mod_time, chunk_ids FROM documents WHERE project_id = $1`,
+		s.projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list documents: %w", err)
+	}
+	defer rows.Close()
+
+	docs := make(map[string]*Document)
+	for rows.Next() {
+		var doc Document
+		var modTime time.Time
+		if err := rows.Scan(&doc.Path, &doc.Hash, &modTime, &doc.ChunkIDs); err != nil {
+			return nil, fmt.Errorf("failed to scan document: %w", err)
+		}
+		doc.ModTime = modTime
+		d := doc
+		docs[doc.Path] = &d
+	}
+
+	return docs, rows.Err()
+}
+
 func (s *PostgresStore) Load(ctx context.Context) error {
 	// No-op for Postgres, data is already persistent
 	return nil

@@ -366,6 +366,42 @@ func (s *QdrantStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return paths, nil
 }
 
+// GetAllDocuments returns a Document per indexed file path in a single
+// Scroll call rather than one per path.
+//
+// Note: QdrantStore does not persist document-level metadata (SaveDocument
+// and DeleteDocument are no-ops here -- chunk-level payloads are the source
+// of truth, and content-hash-based embedding reuse is handled separately via
+// LookupByContentHash). So, matching GetDocument's existing behavior, the
+// returned documents carry only Path; Hash is empty and ChunkIDs is empty.
+// This means the indexer's mtime/hash fast-path does not currently skip
+// re-scanning unchanged files on this backend -- that is a pre-existing gap,
+// not something this bulk method changes. It still removes the
+// one-round-trip-per-path cost of the old GetDocument-in-a-loop pattern for
+// the "does this file's document exist at all" check.
+func (s *QdrantStore) GetAllDocuments(ctx context.Context) (map[string]*Document, error) {
+	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
+		CollectionName: s.collectionName,
+		Limit:          qdrant.PtrOf(uint32(1000)),
+		WithPayload:    qdrant.NewWithPayloadInclude("file_path"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list documents: %w", err)
+	}
+
+	docs := make(map[string]*Document)
+	for _, point := range scrollResult {
+		if val, ok := point.Payload["file_path"]; ok {
+			path := val.GetStringValue()
+			if _, exists := docs[path]; !exists {
+				docs[path] = &Document{Path: path, ChunkIDs: []string{}}
+			}
+		}
+	}
+
+	return docs, nil
+}
+
 func (s *QdrantStore) Load(ctx context.Context) error {
 	return nil
 }

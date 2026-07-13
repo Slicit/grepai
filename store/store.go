@@ -75,6 +75,15 @@ type VectorStore interface {
 	// ListDocuments returns all indexed document paths
 	ListDocuments(ctx context.Context) ([]string, error)
 
+	// GetAllDocuments returns every indexed document, keyed by path, in a
+	// single bulk read. Callers that need to inspect many documents (e.g. the
+	// indexer deciding which files need re-indexing) should prefer this over
+	// calling GetDocument once per path: on network-backed stores (Postgres,
+	// Qdrant) that turns N round trips into one, which matters most on the
+	// very common case of restarting `grepai watch` against a project that is
+	// already fully indexed and unchanged on disk.
+	GetAllDocuments(ctx context.Context) (map[string]*Document, error)
+
 	// Load reads the store from persistent storage
 	Load(ctx context.Context) error
 

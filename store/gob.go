@@ -133,6 +133,23 @@ func (s *GOBStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return paths, nil
 }
 
+// GetAllDocuments returns every document in a single bulk read, guarded by
+// one RLock instead of one lock acquisition per path. Documents are copied
+// out of the internal map so callers can't mutate store state through the
+// returned pointers.
+func (s *GOBStore) GetAllDocuments(ctx context.Context) (map[string]*Document, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	docs := make(map[string]*Document, len(s.documents))
+	for path, doc := range s.documents {
+		d := doc
+		docs[path] = &d
+	}
+
+	return docs, nil
+}
+
 func (s *GOBStore) Load(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
