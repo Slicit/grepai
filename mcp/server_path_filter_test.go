@@ -96,6 +96,20 @@ func (m *MockMCPStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return docs, nil
 }
 
+func (m *MockMCPStore) GetAllDocuments(ctx context.Context) (map[string]*storelib.Document, error) {
+	docs := make(map[string]*storelib.Document)
+	for _, chunk := range m.chunks {
+		if chunk.FilePath == "" {
+			continue
+		}
+		if _, ok := docs[chunk.FilePath]; ok {
+			continue
+		}
+		docs[chunk.FilePath] = &storelib.Document{Path: chunk.FilePath}
+	}
+	return docs, nil
+}
+
 func (m *MockMCPStore) Load(ctx context.Context) error {
 	return nil
 }
