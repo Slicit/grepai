@@ -64,7 +64,7 @@ changelog:
 
 release:
   github:
-    owner: yoanbernabeu
+    owner: Slicit
     name: grepai
   draft: false
   prerelease: auto
@@ -76,15 +76,19 @@ release:
   footer: |
     ---
 
-    **Full Changelog**: https://github.com/yoanbernabeu/grepai/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Full Changelog**: https://github.com/Slicit/grepai/compare/{{ .PreviousTag }}...{{ .Tag }}
 
 brews:
   - repository:
-      owner: yoanbernabeu
+      owner: Slicit
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    # Lets the very first release-branch build succeed even before the tap
+    # repo and its token secret exist: the release-branch workflow sets
+    # SKIP_HOMEBREW=true whenever the GH_PAT secret isn't configured yet.
+    skip_upload: "{{ .Env.SKIP_HOMEBREW }}"
     directory: Formula
-    homepage: https://github.com/yoanbernabeu/grepai
+    homepage: https://github.com/Slicit/grepai
     description: "Privacy-first semantic code search CLI"
     license: MIT
     install: |
