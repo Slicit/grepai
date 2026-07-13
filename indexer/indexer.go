@@ -107,15 +107,21 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	stats.FilesSkipped = len(skipped)
 	stats.ScannedFiles = fileMetas
 
-	// Get existing documents
-	existingDocs, err := idx.store.ListDocuments(ctx)
+	// Get every existing document in one bulk read, instead of one
+	// GetDocument round trip per scanned file below. On the common path of
+	// restarting `grepai watch` against a project that is already fully
+	// indexed and unchanged on disk, this is the difference between a single
+	// store call and N of them (N network round trips on remote backends
+	// like Postgres/Qdrant), for a phase whose only job is confirming that
+	// nothing needs to happen.
+	existingDocs, err := idx.store.GetAllDocuments(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list documents: %w", err)
 	}
 
-	existingMap := make(map[string]bool)
-	for _, doc := range existingDocs {
-		existingMap[doc] = true
+	existingMap := make(map[string]bool, len(existingDocs))
+	for path := range existingDocs {
+		existingMap[path] = true
 	}
 
 	// Every scanned file is accounted for exactly once: it either still exists
@@ -139,12 +145,9 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 
 	for i := range fileMetas {
 		fileMeta := fileMetas[i]
+		doc := existingDocs[fileMeta.Path]
 		g.Go(func() error {
-			decision, err := idx.decideFileScan(gctx, fileMeta)
-			if err != nil {
-				return fmt.Errorf("failed to get document %s: %w", fileMeta.Path, err)
-			}
-			decisions[i] = decision
+			decisions[i] = idx.decideFileScan(gctx, fileMeta, doc)
 
 			if onProgress != nil {
 				n := completed.Add(1)
@@ -241,12 +244,10 @@ type fileScanDecision struct {
 // sequential loop: an mtime fast-path gate, then a content-hash comparison
 // for files that need a closer look. It is safe to call concurrently for
 // different files -- it only reads from the store and the filesystem.
-func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (fileScanDecision, error) {
-	// Fetch the document once -- used by both the mod-time gate and hash check.
-	doc, err := idx.store.GetDocument(ctx, fileMeta.Path)
-	if err != nil {
-		return fileScanDecision{}, err
-	}
+func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta, doc *store.Document) fileScanDecision {
+	// doc comes from a single bulk fetch done once up front (see
+	// IndexAllWithBatchProgress), not a per-file store call -- used by both
+	// the mod-time gate and hash check below.
 
 	// Skip files modified before lastIndexTime -- but only if they have chunks.
 	// Files with no chunks need re-indexing even if their mod_time is old
@@ -254,7 +255,7 @@ func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (file
 	if !idx.lastIndexTime.IsZero() && doc != nil && len(doc.ChunkIDs) > 0 {
 		fileModTime := time.Unix(fileMeta.ModTime, 0)
 		if fileModTime.Before(idx.lastIndexTime) || fileModTime.Equal(idx.lastIndexTime) {
-			return fileScanDecision{countAsSkipped: true}, nil
+			return fileScanDecision{countAsSkipped: true}
 		}
 	}
 
@@ -262,17 +263,17 @@ func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (file
 	file, err := idx.scanner.ScanFile(fileMeta.Path)
 	if err != nil {
 		log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
-		return fileScanDecision{countAsSkipped: true}, nil
+		return fileScanDecision{countAsSkipped: true}
 	}
 	if file == nil {
-		return fileScanDecision{countAsSkipped: true}, nil
+		return fileScanDecision{countAsSkipped: true}
 	}
 
 	if doc != nil && doc.Hash == file.Hash && len(doc.ChunkIDs) > 0 {
-		return fileScanDecision{}, nil // File unchanged and has chunks
+		return fileScanDecision{} // File unchanged and has chunks
 	}
 
-	return fileScanDecision{file: file}, nil
+	return fileScanDecision{file: file}
 }
 
 // scanWorkerLimit returns the number of concurrent workers to use when

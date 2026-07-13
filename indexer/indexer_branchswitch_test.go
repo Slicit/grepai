@@ -203,8 +203,8 @@ func TestIndexAllWithProgress_BinaryFileSkippedAfterMetadataPass(t *testing.T) {
 	if stats.FilesIndexed != 0 {
 		t.Fatalf("expected 0 indexed files, got %d", stats.FilesIndexed)
 	}
-	if !mockStore.listDocsCalled {
-		t.Fatal("expected ListDocuments to be called")
+	if !mockStore.getAllDocsCalled {
+		t.Fatal("expected GetAllDocuments to be called")
 	}
 	if mockEmbedder.embedCalled {
 		t.Fatal("expected embedder to not be called for binary file")
@@ -249,5 +249,110 @@ func TestIndexAllWithProgress_UnreadableFileSkippedAfterMetadataPass(t *testing.
 	}
 	if mockEmbedder.embedCalled {
 		t.Fatal("expected embedder to not be called for unreadable file")
+	}
+}
+
+// latencyStore wraps mockStore and adds a fixed simulated round-trip latency
+// to GetAllDocuments, standing in for a network-backed backend (Postgres,
+// Qdrant) where a store call is a real round trip rather than an in-memory
+// lookup. Only the single bulk call pays this cost -- see GetAllDocuments in
+// indexer.go and store/{postgres,qdrant}.go.
+type latencyStore struct {
+	*mockStore
+	perCallLatency time.Duration
+}
+
+func (l *latencyStore) GetAllDocuments(ctx context.Context) (map[string]*store.Document, error) {
+	time.Sleep(l.perCallLatency)
+	return l.mockStore.GetAllDocuments(ctx)
+}
+
+func seedFullyIndexed(fileCount int) *mockStore {
+	mockStore := newMockStore()
+	for i := range fileCount {
+		path := fmt.Sprintf("file_%04d.go", i)
+		mockStore.documents[path] = store.Document{
+			Path:     path,
+			Hash:     "seeded",
+			ChunkIDs: []string{"c1"},
+		}
+	}
+	return mockStore
+}
+
+// BenchmarkIndexAllWithProgress_FullIndexRestart_NetworkBacked simulates the
+// scenario this change specifically targets: restarting `grepai watch`
+// against a project that is already fully indexed and unchanged on disk, on
+// a network-backed store where a document lookup is a 2ms round trip. Before
+// this change, the scan-decision phase called GetDocument once per file
+// (parallelized across a worker pool, but still N round trips); after, it
+// fetches every document in a single bulk call.
+func BenchmarkIndexAllWithProgress_FullIndexRestart_NetworkBacked(b *testing.B) {
+	ctx := context.Background()
+	tmpDir := b.TempDir()
+	const fileCount = 5000
+	createGoFixtureFiles(b, tmpDir, fileCount)
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		b.Fatalf("failed to create ignore matcher: %v", err)
+	}
+
+	lstore := &latencyStore{mockStore: seedFullyIndexed(fileCount), perCallLatency: 2 * time.Millisecond}
+	mockEmbedder := newMockEmbedder()
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	lastIndexTime := time.Now().Add(1 * time.Hour)
+	idx := NewIndexer(tmpDir, lstore, mockEmbedder, chunker, scanner, lastIndexTime)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		stats, err := idx.IndexAllWithProgress(ctx, nil)
+		if err != nil {
+			b.Fatalf("IndexAllWithProgress failed: %v", err)
+		}
+		if stats.FilesIndexed != 0 {
+			b.Fatalf("expected 0 indexed files, got %d", stats.FilesIndexed)
+		}
+	}
+}
+
+// BenchmarkIndexAllWithProgress_FullIndexRestart_Local is the same restart
+// scenario against a plain in-memory mockStore -- representative of
+// GOBStore, where document lookups are map reads rather than network round
+// trips. Included to show the bulk fetch's effect (or lack of one) is
+// backend-dependent: it does not meaningfully change local-store restart
+// time, because GetDocument was never round-trip-bound there.
+func BenchmarkIndexAllWithProgress_FullIndexRestart_Local(b *testing.B) {
+	ctx := context.Background()
+	tmpDir := b.TempDir()
+	const fileCount = 5000
+	createGoFixtureFiles(b, tmpDir, fileCount)
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		b.Fatalf("failed to create ignore matcher: %v", err)
+	}
+
+	mockStore := seedFullyIndexed(fileCount)
+	mockEmbedder := newMockEmbedder()
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	chunker := NewChunker(512, 50)
+	lastIndexTime := time.Now().Add(1 * time.Hour)
+	idx := NewIndexer(tmpDir, mockStore, mockEmbedder, chunker, scanner, lastIndexTime)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		stats, err := idx.IndexAllWithProgress(ctx, nil)
+		if err != nil {
+			b.Fatalf("IndexAllWithProgress failed: %v", err)
+		}
+		if stats.FilesIndexed != 0 {
+			b.Fatalf("expected 0 indexed files, got %d", stats.FilesIndexed)
+		}
 	}
 }

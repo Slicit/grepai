@@ -28,6 +28,7 @@ type mockStore struct {
 	chunks           map[string]store.Chunk
 	listFilesStats   []store.FileStats
 	listDocsCalled   bool
+	getAllDocsCalled bool
 	getDocCalled     bool
 	saveDocCalled    bool
 	saveChunksCalled bool
@@ -126,6 +127,18 @@ func (m *mockStore) ListDocuments(ctx context.Context) ([]string, error) {
 		paths = append(paths, path)
 	}
 	return paths, nil
+}
+
+func (m *mockStore) GetAllDocuments(ctx context.Context) (map[string]*store.Document, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getAllDocsCalled = true
+	docs := make(map[string]*store.Document, len(m.documents))
+	for path, doc := range m.documents {
+		d := doc
+		docs[path] = &d
+	}
+	return docs, nil
 }
 
 func (m *mockStore) Load(ctx context.Context) error {
