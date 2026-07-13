@@ -1,0 +1,78 @@
+name: Release (branch)
+
+# Builds and publishes a real release every time the "release" branch is
+# pushed, without requiring a manually-created git tag first: this job
+# computes the next patch version, tags it, and runs the same GoReleaser
+# pipeline as release.yml (which still triggers separately on manual "v*"
+# tag pushes for tagged-by-hand releases).
+#
+# Tag creation and the GoReleaser run happen in this same job/run rather
+# than relying on the pushed tag to re-trigger release.yml: pushes made
+# with the default GITHUB_TOKEN do not fire other workflow runs, so a
+# two-workflow handoff here would silently never execute.
+on:
+  push:
+    branches: [release]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Tag and Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine next version
+        id: version
+        run: |
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$latest" ]; then
+            next="v0.1.0"
+          else
+            base="${latest#v}"
+            major="${base%%.*}"
+            rest="${base#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            next="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "latest tag: ${latest:-<none>} -> next: $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Check whether Homebrew tap publishing is configured
+        id: brew
+        run: |
+          if [ -n "${{ secrets.GH_PAT }}" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::GH_PAT secret is not set, so the Homebrew tap publish step will be skipped. Add a GH_PAT repo secret (a PAT with write access to your homebrew-tap repo) once it exists to enable it."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          SKIP_HOMEBREW: ${{ steps.brew.outputs.skip }}
