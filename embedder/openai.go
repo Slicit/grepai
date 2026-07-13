@@ -228,7 +228,7 @@ func (e *OpenAIEmbedder) Close() error {
 // EmbedBatches implements the BatchEmbedder interface.
 // It processes multiple batches concurrently using a bounded worker pool
 // and retries failed requests with exponential backoff.
-func (e *OpenAIEmbedder) EmbedBatches(ctx context.Context, batches []Batch, progress BatchProgress) ([]BatchResult, error) {
+func (e *OpenAIEmbedder) EmbedBatches(ctx context.Context, batches []Batch, progress BatchProgress, onBatchDone BatchResultCallback) ([]BatchResult, error) {
 	if len(batches) == 0 {
 		return nil, nil
 	}
@@ -243,30 +243,39 @@ func (e *OpenAIEmbedder) EmbedBatches(ctx context.Context, batches []Batch, prog
 	var completedChunks atomic.Int64
 
 	results := make([]BatchResult, len(batches))
-	g, ctx := errgroup.WithContext(ctx)
+	g, gctx := errgroup.WithContext(ctx)
 	// Use adaptive rate limiter's current workers for dynamic parallelism
 	g.SetLimit(e.rateLimiter.CurrentWorkers())
 
 	for i := range batches {
 		batch := batches[i]
 		g.Go(func() error {
-			embeddings, err := e.embedBatchWithRetry(ctx, batch, len(batches), totalChunks, &completedChunks, progress)
+			embeddings, err := e.embedBatchWithRetry(gctx, batch, len(batches), totalChunks, &completedChunks, progress)
 			if err != nil {
 				return err
 			}
-			results[batch.Index] = BatchResult{
+			result := BatchResult{
 				BatchIndex: batch.Index,
 				Embeddings: embeddings,
+			}
+			results[batch.Index] = result
+			// Report this batch as done immediately so the caller can save
+			// completed files' chunks now instead of waiting for every
+			// other batch in the run to finish too -- see BatchResultCallback.
+			if onBatchDone != nil {
+				onBatchDone(result)
 			}
 			return nil
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-
-	return results, nil
+	// Note: even if some batch fails, results already holds every batch that
+	// completed successfully before the failure, and onBatchDone has already
+	// been called for each of them. We return results alongside the error
+	// (rather than nil) so a caller that doesn't use onBatchDone still isn't
+	// forced to discard completed work it could otherwise use.
+	err := g.Wait()
+	return results, err
 }
 
 // embedBatchWithRetry embeds a single batch with retry logic for retryable errors.

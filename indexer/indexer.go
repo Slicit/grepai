@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -99,6 +100,19 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	start := time.Now()
 	stats := &IndexStats{}
 
+	// Guarantee a final flush to durable storage no matter how this
+	// function returns (success, error, or a canceled context) -- this is
+	// what makes a run stopped partway through resumable rather than lost:
+	// combined with the periodic checkpoint flushes below, a crash leaves
+	// at most one checkpoint interval's worth of progress unsaved, not the
+	// entire run. Cheap/no-op on Postgres and Qdrant; see checkpoint above.
+	cp := newCheckpoint(ctx, idx)
+	defer func() {
+		if err := idx.store.Persist(ctx); err != nil {
+			log.Printf("Warning: failed to persist index on exit: %v", err)
+		}
+	}()
+
 	// Scan all files (metadata-only first pass)
 	fileMetas, skipped, err := idx.scanner.ScanMetadata()
 	if err != nil {
@@ -176,18 +190,27 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 	}
 
-	// Index files using batch processing if available, otherwise sequentially
+	// Index files using batch processing if available, otherwise sequentially.
+	// Both paths save each file's chunks+document as soon as that file is
+	// fully embedded (see indexFilesBatched and IndexFile), and checkpoint
+	// periodically via cp -- so on an error or a canceled context below, the
+	// stats returned still reflect everything that was actually saved, and
+	// that work is not lost even though this function is returning early.
 	if batchEmbedder, ok := idx.embedder.(embedder.BatchEmbedder); ok && len(filesToIndex) > 0 {
-		indexed, chunks, err := idx.indexFilesBatched(ctx, filesToIndex, batchEmbedder, onBatchProgress)
-		if err != nil {
-			return nil, err
-		}
+		indexed, chunks, err := idx.indexFilesBatched(ctx, filesToIndex, batchEmbedder, onBatchProgress, cp)
 		stats.FilesIndexed = indexed
 		stats.ChunksCreated = chunks
+		if err != nil {
+			stats.Duration = time.Since(start)
+			return stats, err
+		}
 	} else if len(filesToIndex) > 0 {
 		// Sequential indexing for non-batch embedders (e.g., Ollama)
 		total := len(filesToIndex)
 		for i, file := range filesToIndex {
+			if ctx.Err() != nil {
+				break
+			}
 			if onBatchProgress != nil {
 				onBatchProgress(BatchProgressInfo{
 					BatchIndex:      i,
@@ -203,6 +226,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			}
 			stats.FilesIndexed++
 			stats.ChunksCreated += chunks
+			cp.fileSaved()
 		}
 		if onBatchProgress != nil {
 			onBatchProgress(BatchProgressInfo{
@@ -274,6 +298,56 @@ func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta, doc *
 	}
 
 	return fileScanDecision{file: file}
+}
+
+// checkpointInterval is how many newly-saved files trigger a checkpoint
+// flush to durable storage during a run (see checkpoint below).
+const checkpointInterval = 200
+
+// checkpoint periodically flushes the store to durable storage during a
+// long indexing run, so a run that's stopped (Ctrl+C, crash, OOM kill) part
+// of the way through loses at most one checkpoint interval's worth of
+// progress instead of everything indexed so far.
+//
+// This matters most for GOBStore: SaveChunks/SaveDocument only mutate its
+// in-memory maps, and nothing reaches disk until Persist is called, so
+// without periodic checkpointing here a run that dies at, say, 50% through
+// a big repository has written zero of that progress anywhere -- the next
+// run starts completely from scratch. Postgres and Qdrant already commit
+// each SaveChunks/SaveDocument call durably as it happens, so Persist is a
+// cheap no-op for them (see store/postgres.go, store/qdrant.go); calling it
+// here is harmless for those backends, not just for GOB.
+type checkpoint struct {
+	idx        *Indexer
+	ctx        context.Context
+	mu         sync.Mutex
+	sinceFlush int
+}
+
+func newCheckpoint(ctx context.Context, idx *Indexer) *checkpoint {
+	return &checkpoint{idx: idx, ctx: ctx}
+}
+
+// fileSaved records that one more file's chunks and document were just
+// saved, flushing to durable storage once checkpointInterval files have
+// accumulated since the last flush. Safe to call concurrently.
+func (c *checkpoint) fileSaved() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.sinceFlush++
+	flush := c.sinceFlush >= checkpointInterval
+	if flush {
+		c.sinceFlush = 0
+	}
+	c.mu.Unlock()
+
+	if flush {
+		if err := c.idx.store.Persist(c.ctx); err != nil {
+			log.Printf("Warning: failed to checkpoint index progress: %v", err)
+		}
+	}
 }
 
 // scanWorkerLimit returns the number of concurrent workers to use when
@@ -451,6 +525,7 @@ func (idx *Indexer) indexFilesBatched(
 	files []FileInfo,
 	batchEmb embedder.BatchEmbedder,
 	onProgress BatchProgressCallback,
+	cp *checkpoint,
 ) (filesIndexed int, chunksCreated int, err error) {
 	fileData, fileChunks, err := idx.prepareFileChunks(ctx, files)
 	if err != nil {
@@ -516,7 +591,7 @@ func (idx *Indexer) indexFilesBatched(
 		log.Printf("Reused %d cached embeddings across %d files", totalCacheHits, len(preFilledFiles))
 	}
 
-	// Save fully-cached files immediately
+	// Save fully-cached files immediately.
 	now := time.Now()
 	for _, pf := range preFilledFiles {
 		fd := fileData[pf.fdIndex]
@@ -527,32 +602,129 @@ func (idx *Indexer) indexFilesBatched(
 		}
 		filesIndexed++
 		chunksCreated += len(chunks)
+		cp.fileSaved()
 	}
 
-	// Embed remaining (non-cached) files
+	// Embed remaining (non-cached) files. Each file's chunks+document are
+	// saved as soon as every chunk belonging to that file has an embedding
+	// back -- via the onBatchDone callback below -- instead of waiting for
+	// every batch across the whole run to finish first. Without this, a run
+	// stopped or crashed partway through a large batch-embedded repository
+	// would lose every file that hadn't been saved yet, even ones whose
+	// embeddings had already come back successfully; see BatchResultCallback.
+	//
+	// A single file's chunks can be split across more than one batch --
+	// batches are packed by size/token limit, not by file boundary -- so
+	// completion is tracked per file across however many batches its chunks
+	// landed in, not per batch.
 	if len(remainingFileChunks) > 0 {
 		batches := embedder.FormBatches(remainingFileChunks)
-		results, err := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress))
-		if err != nil {
-			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", err)
+
+		// fileIndexToPos maps a file's original index (i.e. its position in
+		// the `files` slice passed to this function, as carried by
+		// embedder.FileChunks.FileIndex/BatchEntry.FileIndex) to its
+		// position in remainingFileData/remainingFileChunks.
+		fileIndexToPos := make(map[int]int, len(remainingFileData))
+		for pos, fd := range remainingFileData {
+			fileIndexToPos[fd.fileIndex] = pos
 		}
 
-		fileEmbeddings := embedder.MapResultsToFiles(batches, results, len(files))
+		pending := make([][][]float32, len(remainingFileData)) // per-file embeddings, filled in as batches complete
+		remaining := make([]int, len(remainingFileData))       // chunks still awaiting an embedding, per file
+		for pos, fd := range remainingFileData {
+			pending[pos] = make([][]float32, len(fd.chunkInfos))
+			remaining[pos] = len(fd.chunkInfos)
+		}
 
-		for _, fd := range remainingFileData {
-			embeddings := fileEmbeddings[fd.fileIndex]
-			if len(embeddings) != len(fd.chunkInfos) {
-				log.Printf("Warning: embedding count mismatch for %s: got %d, expected %d",
-					fd.file.Path, len(embeddings), len(fd.chunkInfos))
-				continue
+		var (
+			mu          sync.Mutex
+			savedFiles  int
+			savedChunks int
+			saveErr     error
+		)
+
+		onBatchDone := func(result embedder.BatchResult) {
+			if result.BatchIndex < 0 || result.BatchIndex >= len(batches) {
+				return
 			}
-			idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
-			chunks, chunkIDs := createStoreChunks(fd.chunkInfos, embeddings, now)
-			if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
-				return filesIndexed, chunksCreated, err
+			batch := batches[result.BatchIndex]
+
+			// Bookkeeping (which files just became complete) happens under
+			// the lock; the actual saves (I/O) happen after releasing it so
+			// a slow store call for one file doesn't block bookkeeping for
+			// batches completing concurrently on other files.
+			var readyToSave []int
+			mu.Lock()
+			for i, entry := range batch.Entries {
+				pos, ok := fileIndexToPos[entry.FileIndex]
+				if !ok || i >= len(result.Embeddings) {
+					continue
+				}
+				vecs := pending[pos]
+				if entry.ChunkIndex < 0 || entry.ChunkIndex >= len(vecs) {
+					continue
+				}
+				vecs[entry.ChunkIndex] = result.Embeddings[i]
+				remaining[pos]--
+				if remaining[pos] == 0 {
+					readyToSave = append(readyToSave, pos)
+				}
 			}
-			filesIndexed++
-			chunksCreated += len(chunks)
+			mu.Unlock()
+
+			for _, pos := range readyToSave {
+				fd := remainingFileData[pos]
+				vecs := pending[pos]
+
+				complete := true
+				for _, v := range vecs {
+					if v == nil {
+						complete = false
+						break
+					}
+				}
+				if !complete {
+					// Shouldn't happen (every chunk's batch reported success
+					// for remaining[pos] to reach 0), but don't save a
+					// partial/corrupt document if it somehow does -- the
+					// next run will pick this file up again.
+					log.Printf("Warning: %s completed with missing embeddings, will retry next run", fd.file.Path)
+					continue
+				}
+
+				idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
+				chunks, chunkIDs := createStoreChunks(fd.chunkInfos, vecs, time.Now())
+				if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
+					mu.Lock()
+					if saveErr == nil {
+						saveErr = err
+					}
+					mu.Unlock()
+					log.Printf("Failed to save %s: %v", fd.file.Path, err)
+					continue
+				}
+
+				mu.Lock()
+				savedFiles++
+				savedChunks += len(chunks)
+				mu.Unlock()
+				cp.fileSaved()
+			}
+		}
+
+		_, embedErr := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress), onBatchDone)
+
+		mu.Lock()
+		filesIndexed += savedFiles
+		chunksCreated += savedChunks
+		finalSaveErr := saveErr
+		mu.Unlock()
+
+		if embedErr != nil {
+			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", embedErr)
+		}
+		if finalSaveErr != nil {
+			return filesIndexed, chunksCreated, finalSaveErr
 		}
 	}
 

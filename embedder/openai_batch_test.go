@@ -95,7 +95,7 @@ func TestOpenAIEmbedder_EmbedBatches_ParallelismLimit(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	results, err := e.EmbedBatches(ctx, batches, nil)
+	results, err := e.EmbedBatches(ctx, batches, nil, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestOpenAIEmbedder_EmbedBatches_ResultMapping(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	results, err := e.EmbedBatches(ctx, batches, nil)
+	results, err := e.EmbedBatches(ctx, batches, nil, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestOpenAIEmbedder_EmbedBatches_RetryOn429(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	results, err := e.EmbedBatches(ctx, batches, progress)
+	results, err := e.EmbedBatches(ctx, batches, progress, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestOpenAIEmbedder_EmbedBatches_FailOn4xx(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err = e.EmbedBatches(ctx, batches, nil)
+	_, err = e.EmbedBatches(ctx, batches, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for 401 response")
 	}
@@ -369,7 +369,7 @@ func TestOpenAIEmbedder_EmbedBatches_ContextCancellation(t *testing.T) {
 
 	errChan := make(chan error, 1)
 	go func() {
-		_, err := e.EmbedBatches(ctx, batches, nil)
+		_, err := e.EmbedBatches(ctx, batches, nil, nil)
 		errChan <- err
 	}()
 
@@ -398,7 +398,7 @@ func TestOpenAIEmbedder_EmbedBatches_EmptyInput(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	results, err := e.EmbedBatches(ctx, nil, nil)
+	results, err := e.EmbedBatches(ctx, nil, nil, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestOpenAIEmbedder_EmbedBatches_EmptyInput(t *testing.T) {
 		t.Errorf("expected nil results for empty input, got %v", results)
 	}
 
-	results, err = e.EmbedBatches(ctx, []Batch{}, nil)
+	results, err = e.EmbedBatches(ctx, []Batch{}, nil, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestOpenAIEmbedder_EmbedBatches_ProgressCallback(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err = e.EmbedBatches(ctx, batches, progress)
+	_, err = e.EmbedBatches(ctx, batches, progress, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -594,7 +594,7 @@ func TestOpenAIEmbedder_EmbedBatches_RetryOn5xx(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	results, err := e.EmbedBatches(ctx, batches, progress)
+	results, err := e.EmbedBatches(ctx, batches, progress, nil)
 	if err != nil {
 		t.Fatalf("EmbedBatches failed: %v", err)
 	}
@@ -658,7 +658,7 @@ func TestOpenAIEmbedder_EmbedBatches_MaxRetryLimit(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err = e.EmbedBatches(ctx, batches, nil)
+	_, err = e.EmbedBatches(ctx, batches, nil, nil)
 	if err == nil {
 		t.Fatal("expected error after max retries")
 	}
@@ -737,7 +737,7 @@ func TestOpenAIEmbedder_EmbedBatches_ParallelBatchFailure(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err = e.EmbedBatches(ctx, batches, nil)
+	_, err = e.EmbedBatches(ctx, batches, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when batch fails")
 	}
@@ -749,5 +749,143 @@ func TestOpenAIEmbedder_EmbedBatches_ParallelBatchFailure(t *testing.T) {
 	}
 	if retryErr.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected status 401, got %d", retryErr.StatusCode)
+	}
+}
+
+// TestOpenAIEmbedder_EmbedBatches_OnBatchDoneCalledPerBatch verifies that
+// onBatchDone fires for each batch as it completes, before EmbedBatches has
+// finished waiting on every other batch -- this is what lets a caller (the
+// indexer) save a file's chunks as soon as that file's embeddings are ready,
+// instead of only after the entire run finishes. See BatchResultCallback.
+func TestOpenAIEmbedder_EmbedBatches_OnBatchDoneCalledPerBatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openAIEmbedRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp := mockEmbeddingResponse(len(req.Input))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	e, err := NewOpenAIEmbedder(
+		WithOpenAIKey("test-key"),
+		WithOpenAIEndpoint(server.URL),
+		WithOpenAIParallelism(4),
+		WithOpenAIDimensions(3),
+	)
+	if err != nil {
+		t.Fatalf("failed to create embedder: %v", err)
+	}
+
+	const numBatches = 5
+	batches := make([]Batch, numBatches)
+	for i := range batches {
+		batches[i] = Batch{
+			Index:   i,
+			Entries: []BatchEntry{{FileIndex: i, ChunkIndex: 0, Content: "content"}},
+		}
+	}
+
+	var (
+		mu    sync.Mutex
+		seen  = make(map[int]bool)
+		calls int
+	)
+	onBatchDone := func(result BatchResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		seen[result.BatchIndex] = true
+		if len(result.Embeddings) != 1 {
+			t.Errorf("expected 1 embedding in batch %d result, got %d", result.BatchIndex, len(result.Embeddings))
+		}
+	}
+
+	results, err := e.EmbedBatches(context.Background(), batches, nil, onBatchDone)
+	if err != nil {
+		t.Fatalf("EmbedBatches failed: %v", err)
+	}
+	if len(results) != numBatches {
+		t.Fatalf("expected %d results, got %d", numBatches, len(results))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != numBatches {
+		t.Fatalf("expected onBatchDone called %d times, got %d", numBatches, calls)
+	}
+	for i := 0; i < numBatches; i++ {
+		if !seen[i] {
+			t.Errorf("onBatchDone was never called for batch %d", i)
+		}
+	}
+}
+
+// TestOpenAIEmbedder_EmbedBatches_PartialResultsSurviveFailure verifies that
+// when one batch fails, EmbedBatches still returns the results for batches
+// that succeeded (rather than discarding everything), and onBatchDone still
+// fired for each of those successful batches before the error was returned.
+func TestOpenAIEmbedder_EmbedBatches_PartialResultsSurviveFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openAIEmbedRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for _, input := range req.Input {
+			if strings.Contains(input, "poison") {
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]string{"message": "Invalid API key", "type": "invalid_request_error"},
+				})
+				return
+			}
+		}
+		resp := mockEmbeddingResponse(len(req.Input))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	e, err := NewOpenAIEmbedder(
+		WithOpenAIKey("test-key"),
+		WithOpenAIEndpoint(server.URL),
+		WithOpenAIParallelism(1), // sequential, so batch 0 reliably completes before batch 1 is attempted
+		WithOpenAIDimensions(3),
+	)
+	if err != nil {
+		t.Fatalf("failed to create embedder: %v", err)
+	}
+
+	batches := []Batch{
+		{Index: 0, Entries: []BatchEntry{{FileIndex: 0, ChunkIndex: 0, Content: "good content"}}},
+		{Index: 1, Entries: []BatchEntry{{FileIndex: 1, ChunkIndex: 0, Content: "poison content"}}},
+	}
+
+	var mu sync.Mutex
+	var doneForGoodBatch bool
+	onBatchDone := func(result BatchResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		if result.BatchIndex == 0 {
+			doneForGoodBatch = true
+		}
+	}
+
+	results, err := e.EmbedBatches(context.Background(), batches, nil, onBatchDone)
+	if err == nil {
+		t.Fatal("expected an error from the poisoned batch")
+	}
+	if !doneForGoodBatch {
+		t.Fatal("expected onBatchDone to have been called for the successful batch before the failure")
+	}
+	if results == nil {
+		t.Fatal("expected partial results to be returned alongside the error, got nil")
+	}
+	if len(results[0].Embeddings) != 1 {
+		t.Fatalf("expected the successful batch's result to be preserved, got %+v", results[0])
 	}
 }
