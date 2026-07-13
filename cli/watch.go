@@ -2952,6 +2952,24 @@ func (p *projectPrefixStore) ListDocuments(ctx context.Context) ([]string, error
 	return p.store.ListDocuments(ctx)
 }
 
+func (p *projectPrefixStore) GetAllDocuments(ctx context.Context) (map[string]*store.Document, error) {
+	docs, err := p.store.GetAllDocuments(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix := p.getPrefix() + "/"
+	result := make(map[string]*store.Document, len(docs))
+	for path, doc := range docs {
+		relPath, ok := strings.CutPrefix(path, prefix)
+		if !ok {
+			continue // belongs to a different project sharing this store
+		}
+		result[relPath] = doc
+	}
+	return result, nil
+}
+
 func (p *projectPrefixStore) Load(ctx context.Context) error {
 	return p.store.Load(ctx)
 }

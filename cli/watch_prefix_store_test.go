@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ type mockVectorStore struct {
 	savedDocument         store.Document
 	deletedDocumentPath   string
 	listDocumentsResult   []string
+	getAllDocumentsResult map[string]*store.Document
 	getStatsResult        *store.IndexStats
 	listFilesResult       []store.FileStats
 	getChunksForFilePath  string
@@ -62,6 +64,10 @@ func (m *mockVectorStore) DeleteDocument(_ context.Context, filePath string) err
 
 func (m *mockVectorStore) ListDocuments(_ context.Context) ([]string, error) {
 	return m.listDocumentsResult, nil
+}
+
+func (m *mockVectorStore) GetAllDocuments(_ context.Context) (map[string]*store.Document, error) {
+	return m.getAllDocumentsResult, nil
 }
 
 func (m *mockVectorStore) Load(_ context.Context) error {
@@ -210,6 +216,50 @@ func TestProjectPrefixStore_PathMappedMethods(t *testing.T) {
 	}
 	if mock.deletedDocumentPath != prefixed {
 		t.Errorf("DeleteDocument(abs) path = %q, want %q", mock.deletedDocumentPath, prefixed)
+	}
+}
+
+func TestProjectPrefixStore_GetAllDocuments(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+	wrapped := &projectPrefixStore{
+		store:         nil, // set below, after we know the prefix
+		workspaceName: "ws",
+		projectName:   "proj",
+		projectPath:   projectRoot,
+	}
+	prefix := wrapped.getPrefix() + "/"
+
+	mock := &mockVectorStore{
+		getAllDocumentsResult: map[string]*store.Document{
+			prefix + "pkg/x.go":      {Path: prefix + "pkg/x.go", Hash: "h1"},
+			prefix + "pkg/y.go":      {Path: prefix + "pkg/y.go", Hash: "h2"},
+			"ws/other-proj/pkg/z.go": {Path: "ws/other-proj/pkg/z.go", Hash: "h3"},
+		},
+	}
+	wrapped.store = mock
+
+	docs, err := wrapped.GetAllDocuments(ctx)
+	if err != nil {
+		t.Fatalf("GetAllDocuments failed: %v", err)
+	}
+
+	if len(docs) != 2 {
+		t.Fatalf("expected 2 documents for this project, got %d: %+v", len(docs), docs)
+	}
+	if doc, ok := docs["pkg/x.go"]; !ok || doc.Hash != "h1" {
+		t.Errorf("expected unprefixed key %q with hash h1, got %+v", "pkg/x.go", docs["pkg/x.go"])
+	}
+	if doc, ok := docs["pkg/y.go"]; !ok || doc.Hash != "h2" {
+		t.Errorf("expected unprefixed key %q with hash h2, got %+v", "pkg/y.go", docs["pkg/y.go"])
+	}
+	if _, ok := docs[prefix+"pkg/x.go"]; ok {
+		t.Errorf("did not expect a still-prefixed key in the result")
+	}
+	for path := range docs {
+		if strings.Contains(path, "other-proj") {
+			t.Errorf("document from a different project leaked into result: %q", path)
+		}
 	}
 }
 

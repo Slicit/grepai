@@ -84,6 +84,10 @@ func (m *MockStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return nil, nil
 }
 
+func (m *MockStore) GetAllDocuments(ctx context.Context) (map[string]*store.Document, error) {
+	return nil, nil
+}
+
 func (m *MockStore) Load(ctx context.Context) error {
 	return nil
 }
