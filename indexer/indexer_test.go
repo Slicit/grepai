@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -496,9 +497,19 @@ func TestIndexAllWithProgress_DeletedFilesRemoved(t *testing.T) {
 }
 
 // mockBatchEmbedder implements embedder.BatchEmbedder for testing progress tracking
+// and, via failAfter, for simulating a run that dies partway through (e.g. a
+// crashed process or a lost network connection) after some batches have
+// already completed successfully.
 type mockBatchEmbedder struct {
 	embedCalled bool
 	delay       time.Duration // Optional delay per batch for testing concurrency
+
+	// failAfter, if > 0, causes EmbedBatches to stop and return an error
+	// once this many batches have completed successfully -- simulating an
+	// interruption partway through a run. Batches up to that point still
+	// report their results via onBatchDone before the error is returned,
+	// matching what the real embedder does on a partial failure.
+	failAfter int
 }
 
 func newMockBatchEmbedder() *mockBatchEmbedder {
@@ -527,7 +538,7 @@ func (m *mockBatchEmbedder) Close() error {
 	return nil
 }
 
-func (m *mockBatchEmbedder) EmbedBatches(ctx context.Context, batches []embedder.Batch, progress embedder.BatchProgress) ([]embedder.BatchResult, error) {
+func (m *mockBatchEmbedder) EmbedBatches(ctx context.Context, batches []embedder.Batch, progress embedder.BatchProgress, onBatchDone embedder.BatchResultCallback) ([]embedder.BatchResult, error) {
 	m.embedCalled = true
 
 	// Calculate total chunks for progress reporting
@@ -539,7 +550,11 @@ func (m *mockBatchEmbedder) EmbedBatches(ctx context.Context, batches []embedder
 	var completedChunks int
 	results := make([]embedder.BatchResult, len(batches))
 
-	for _, batch := range batches {
+	for i, batch := range batches {
+		if m.failAfter > 0 && i >= m.failAfter {
+			return results, fmt.Errorf("mock embedder: simulated interruption after %d batch(es)", m.failAfter)
+		}
+
 		if m.delay > 0 {
 			time.Sleep(m.delay)
 		}
@@ -557,9 +572,13 @@ func (m *mockBatchEmbedder) EmbedBatches(ctx context.Context, batches []embedder
 			progress(batch.Index, len(batches), completedChunks, totalChunks, false, 0, 0)
 		}
 
-		results[batch.Index] = embedder.BatchResult{
+		result := embedder.BatchResult{
 			BatchIndex: batch.Index,
 			Embeddings: embeddings,
+		}
+		results[batch.Index] = result
+		if onBatchDone != nil {
+			onBatchDone(result)
 		}
 	}
 
