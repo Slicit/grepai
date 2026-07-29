@@ -74,12 +74,19 @@ func writeTinyFiles(t *testing.T, dir string, n int) {
 // worker pool is still working through the rest.
 func TestIndexAllWithBatchProgress_EmbeddingStartsBeforeScanCompletes(t *testing.T) {
 	tmpDir := t.TempDir()
-	const totalFiles = embedWaveSize * 3
+	// A large multiple of embedWaveSize (not just enough for a couple of
+	// waves) so decide-phase's total real work -- reading, hashing, and
+	// deciding every file -- is clearly larger than the fixed, roughly
+	// constant per-wave dispatch overhead (forming/logging/dispatching wave
+	// 1). That asymmetry is what makes the margin between "wave 1 starts
+	// embedding" and "decide-phase finishes" grow with file count, so this
+	// stays robust under system load/scheduling jitter instead of being a
+	// tight race between two roughly-equal durations.
+	const totalFiles = embedWaveSize * 25
 	writeTinyFiles(t, tmpDir, totalFiles)
 
 	mockStore := newMockStore()
 	mockEmb := &waveTrackingEmbedder{}
-	mockEmb.delay = 15 * time.Millisecond // widen the window so scheduling jitter can't hide the effect
 
 	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
 	if err != nil {
