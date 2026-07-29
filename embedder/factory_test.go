@@ -31,6 +31,40 @@ func TestNewFromConfig_Ollama(t *testing.T) {
 	}
 }
 
+// TestNewFromConfig_Ollama_ParallelismAndBatchSize verifies the factory
+// wires config.Embedder.Parallelism and config.Embedder.BatchSize through
+// to the Ollama embedder. Without this wiring, those config fields have no
+// effect on Ollama regardless of how high a user sets them.
+func TestNewFromConfig_Ollama_ParallelismAndBatchSize(t *testing.T) {
+	cfg := &config.Config{
+		Embedder: config.EmbedderConfig{
+			Provider:    "ollama",
+			Model:       "nomic-embed-text",
+			Endpoint:    "http://localhost:11434",
+			Parallelism: 64,
+			BatchSize:   128,
+		},
+	}
+
+	emb, err := NewFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("failed to create embedder: %v", err)
+	}
+	defer emb.Close()
+
+	ollamaEmb, ok := emb.(*OllamaEmbedder)
+	if !ok {
+		t.Fatalf("expected *OllamaEmbedder, got %T", emb)
+	}
+
+	if ollamaEmb.parallelism != 64 {
+		t.Errorf("expected parallelism 64, got %d", ollamaEmb.parallelism)
+	}
+	if ollamaEmb.batchSize != 128 {
+		t.Errorf("expected batchSize 128, got %d", ollamaEmb.batchSize)
+	}
+}
+
 func TestNewFromConfig_OpenAI(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 
