@@ -166,7 +166,26 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	// split what would otherwise be one larger, marginally more efficient
 	// batch. Both are minor compared to eliminating the scan-then-embed
 	// stall.
-	filesCh := make(chan FileInfo, embedWaveSize)
+	//
+	// filesCh is sized to hold every file in the repo, not just one wave's
+	// worth. This is deliberate: the old, fully-sequential implementation
+	// already held the entire filesToIndex slice in memory at once, so
+	// this doesn't raise peak memory usage versus before -- but it does
+	// guarantee the producer below can never block trying to send. With a
+	// smaller (e.g. embedWaveSize-sized) buffer, a wave that's slow to
+	// embed -- for example because a store's cache lookup is hanging or
+	// erroring repeatedly (see cacheLookupTimeout) -- fills the channel and
+	// stalls every decide-phase worker mid-send, which freezes the scan
+	// progress counter too, not just embedding. That made a downstream
+	// backend problem look like scanning itself had hung. Sizing the
+	// buffer to the whole run means the decide/scan phase always keeps
+	// running at full speed and reports real progress, regardless of how
+	// slow or stuck embedding gets.
+	filesChCap := len(fileMetas)
+	if filesChCap < 1 {
+		filesChCap = 1
+	}
+	filesCh := make(chan FileInfo, filesChCap)
 
 	var (
 		statsMu   sync.Mutex
@@ -394,6 +413,27 @@ const checkpointInterval = 200
 // slightly more efficient batches. 200 mirrors checkpointInterval's
 // granularity as a reasonable default for both.
 const embedWaveSize = 200
+
+// cacheLookupTimeout bounds how long a single content-addressed cache
+// lookup (store.EmbeddingCache.LookupByContentHash) may take. For a remote
+// backend like Qdrant this is a network call; without a bound, a slow or
+// wedged connection can stall indefinitely. A timeout here is treated the
+// same as any other lookup error (see lookupCachedEmbeddingWithTimeout):
+// it's just a cache miss, so that chunk gets re-embedded instead of reused.
+// Declared as a var (not const) so tests can temporarily shorten it to
+// exercise the timeout path without a real 10-second wait.
+var cacheLookupTimeout = 10 * time.Second
+
+// lookupCachedEmbeddingWithTimeout wraps store.EmbeddingCache.LookupByContentHash
+// with cacheLookupTimeout, so a single slow or unresponsive lookup can't
+// block whichever caller is waiting on it forever. Used by both the
+// per-wave pre-fill in indexFilesBatched and the per-file lookup in
+// lookupCachedEmbeddings.
+func lookupCachedEmbeddingWithTimeout(ctx context.Context, cache store.EmbeddingCache, contentHash string) ([]float32, bool, error) {
+	lookupCtx, cancel := context.WithTimeout(ctx, cacheLookupTimeout)
+	defer cancel()
+	return cache.LookupByContentHash(lookupCtx, contentHash)
+}
 
 // checkpoint periodically flushes the store to durable storage during a
 // long indexing run, so a run that's stopped (Ctrl+C, crash, OOM kill) part
@@ -629,13 +669,68 @@ func (idx *Indexer) indexFilesBatched(
 
 	// Check embedding cache for content-addressed deduplication
 	cache, hasCache := idx.store.(store.EmbeddingCache)
-	var totalCacheHits int
+	var totalCacheHits atomic.Int64
 
 	// Pre-fill cached embeddings and filter out fully-cached files
 	type preFilled struct {
 		fdIndex   int
 		vectors   [][]float32
 		allCached bool
+	}
+
+	// cacheChecked[i] holds the outcome of checking fileData[i]'s chunks
+	// against the cache. Looked up concurrently (bounded by
+	// scanWorkerLimit()) instead of one file, one chunk, one blocking store
+	// round trip at a time: on a remote backend like Qdrant, a wave of up
+	// to embedWaveSize files each with several chunks meant hundreds of
+	// sequential network calls before embedding could even start for files
+	// that weren't cached at all. Each lookup is also bounded by
+	// cacheLookupTimeout, so a single slow or wedged store connection can't
+	// stall this indefinitely -- it's treated as a cache miss (the same
+	// fallback already used for a lookup error) and that file just gets
+	// re-embedded instead of reused from cache.
+	type cacheCheck struct {
+		vecs      [][]float32
+		allCached bool
+	}
+	cacheChecked := make([]cacheCheck, len(fileData))
+
+	if hasCache {
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(scanWorkerLimit())
+		for i := range fileData {
+			i := i
+			fd := fileData[i]
+			g.Go(func() error {
+				vecs := make([][]float32, len(fd.chunkInfos))
+				allCached := true
+				for j, chunk := range fd.chunkInfos {
+					if chunk.ContentHash == "" {
+						allCached = false
+						continue
+					}
+					vec, found, err := lookupCachedEmbeddingWithTimeout(gctx, cache, chunk.ContentHash)
+					if err != nil {
+						log.Printf("Warning: cache lookup failed: %v", err)
+						allCached = false
+						continue
+					}
+					if found {
+						vecs[j] = vec
+						totalCacheHits.Add(1)
+					} else {
+						allCached = false
+					}
+				}
+				cacheChecked[i] = cacheCheck{vecs: vecs, allCached: allCached}
+				return nil
+			})
+		}
+		// Cache lookups are a pure optimization (skip re-embedding content
+		// that's already embedded elsewhere) -- a failure is already
+		// handled per-lookup above as a cache miss, so every goroutine here
+		// always returns nil and this can never itself fail the run.
+		_ = g.Wait()
 	}
 
 	var preFilledFiles []preFilled
@@ -649,37 +744,17 @@ func (idx *Indexer) indexFilesBatched(
 			continue
 		}
 
-		vecs := make([][]float32, len(fd.chunkInfos))
-		allCached := true
-		for j, chunk := range fd.chunkInfos {
-			if chunk.ContentHash == "" {
-				allCached = false
-				continue
-			}
-			vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
-			if err != nil {
-				log.Printf("Warning: cache lookup failed: %v", err)
-				allCached = false
-				continue
-			}
-			if found {
-				vecs[j] = vec
-				totalCacheHits++
-			} else {
-				allCached = false
-			}
-		}
-
-		if allCached {
-			preFilledFiles = append(preFilledFiles, preFilled{fdIndex: i, vectors: vecs, allCached: true})
+		checked := cacheChecked[i]
+		if checked.allCached {
+			preFilledFiles = append(preFilledFiles, preFilled{fdIndex: i, vectors: checked.vecs, allCached: true})
 		} else {
 			remainingFileData = append(remainingFileData, fd)
 			remainingFileChunks = append(remainingFileChunks, fileChunks[i])
 		}
 	}
 
-	if totalCacheHits > 0 {
-		log.Printf("Reused %d cached embeddings across %d files", totalCacheHits, len(preFilledFiles))
+	if hits := totalCacheHits.Load(); hits > 0 {
+		log.Printf("Reused %d cached embeddings across %d files", hits, len(preFilledFiles))
 	}
 
 	// Save fully-cached files immediately.
@@ -1072,7 +1147,7 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkIn
 		if chunk.ContentHash == "" {
 			continue
 		}
-		vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
+		vec, found, err := lookupCachedEmbeddingWithTimeout(ctx, cache, chunk.ContentHash)
 		if err != nil {
 			log.Printf("Warning: cache lookup failed for content hash %s: %v", chunk.ContentHash[:8], err)
 			continue
