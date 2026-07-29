@@ -280,6 +280,65 @@ func TestPrintProgressAndBatchProgress(t *testing.T) {
 	})
 }
 
+// TestPrintBatchProgress_ProvisionalVsFinal is the regression test for the
+// fix to a misleading progress display: because embedding overlaps with
+// scan/decide (see indexer.IndexAllWithBatchProgress), TotalChunks can grow
+// across waves, and rendering every update as a normal percentage bar made
+// a run look like it repeatedly hit 100% and restarted (e.g. 1557/1557,
+// then 2555/2555, then climbing again) instead of steadily progressing
+// toward one real total. printBatchProgress must render an open-ended
+// count (no bar, no percentage) while info.Provisional is true, and only
+// switch to the normal "[bar] X% (completed/total)" form once
+// Provisional is false.
+func TestPrintBatchProgress_ProvisionalVsFinal(t *testing.T) {
+	oldNoUI := watchNoUI
+	watchNoUI = true
+	defer func() { watchNoUI = oldNoUI }()
+
+	capture := func(fn func()) string {
+		oldStdout := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("Pipe() failed: %v", err)
+		}
+		os.Stdout = w
+		fn()
+		_ = w.Close()
+		os.Stdout = oldStdout
+
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, r); err != nil {
+			t.Fatalf("io.Copy() failed: %v", err)
+		}
+		return buf.String()
+	}
+
+	provisionalOut := capture(func() {
+		printBatchProgress(indexer.BatchProgressInfo{
+			TotalChunks:     3044,
+			CompletedChunks: 2926,
+			Provisional:     true,
+		})
+	})
+	if strings.Contains(provisionalOut, "[") || strings.Contains(provisionalOut, "%") {
+		t.Errorf("expected a provisional update to avoid a bar/percentage (since the total may still grow), got %q", provisionalOut)
+	}
+	if !strings.Contains(provisionalOut, "2926") || !strings.Contains(provisionalOut, "3044") {
+		t.Errorf("expected the provisional update to still report the counts so far, got %q", provisionalOut)
+	}
+
+	finalOut := capture(func() {
+		printBatchProgress(indexer.BatchProgressInfo{
+			TotalChunks:     3044,
+			CompletedChunks: 3044,
+			Provisional:     false,
+		})
+	})
+	if !strings.Contains(finalOut, "Embedding [") || !strings.Contains(finalOut, "100%") {
+		t.Errorf("expected a final (non-provisional) update to render the normal percentage bar, got %q", finalOut)
+	}
+}
+
 func TestPrintProgressAndBatchProgress_NoUIModeUsesNewlines(t *testing.T) {
 	oldNoUI := watchNoUI
 	watchNoUI = true
