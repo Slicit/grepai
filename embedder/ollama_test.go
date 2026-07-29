@@ -352,3 +352,136 @@ func makeEntries(fileIndex, n int) []BatchEntry {
 	}
 	return entries
 }
+
+// TestOllamaEmbedder_TimeoutFor_ScalesWithBatchSize verifies the fix for a
+// bug where a fixed 120s http.Client timeout was shared by every request
+// regardless of how many texts it carried. That was fine when each request
+// embedded a single text, but once bulk batching (see EmbedBatch/
+// EmbedBatches) started sending defaultOllamaBatchSize texts per request,
+// a CPU-only Ollama install -- which typically processes a batch close to
+// linearly rather than getting GPU-style batch speedup -- could blow past
+// that fixed budget for a full batch even though a single-text request (or
+// an equivalent curl) completed almost instantly. timeoutFor must scale the
+// budget with the number of texts in the specific request.
+func TestOllamaEmbedder_TimeoutFor_ScalesWithBatchSize(t *testing.T) {
+	e := NewOllamaEmbedder()
+
+	one := e.timeoutFor(1)
+	batch := e.timeoutFor(defaultOllamaBatchSize)
+
+	if batch <= one {
+		t.Fatalf("expected timeout for a %d-text batch (%v) to be greater than for a single text (%v)",
+			defaultOllamaBatchSize, batch, one)
+	}
+
+	wantOne := defaultOllamaMinTimeout + defaultOllamaPerTextTimeout
+	if one != wantOne {
+		t.Errorf("timeoutFor(1) = %v, want %v", one, wantOne)
+	}
+
+	wantBatch := defaultOllamaMinTimeout + time.Duration(defaultOllamaBatchSize)*defaultOllamaPerTextTimeout
+	if batch != wantBatch {
+		t.Errorf("timeoutFor(%d) = %v, want %v", defaultOllamaBatchSize, batch, wantBatch)
+	}
+}
+
+// TestOllamaEmbedder_WithTimeout_OverridesScaling verifies that
+// WithOllamaTimeout pins one fixed timeout for every request regardless of
+// batch size, for setups where the default scaling still isn't right.
+func TestOllamaEmbedder_WithTimeout_OverridesScaling(t *testing.T) {
+	fixed := 7 * time.Second
+	e := NewOllamaEmbedder(WithOllamaTimeout(fixed))
+
+	if got := e.timeoutFor(1); got != fixed {
+		t.Errorf("timeoutFor(1) = %v, want fixed override %v", got, fixed)
+	}
+	if got := e.timeoutFor(defaultOllamaBatchSize); got != fixed {
+		t.Errorf("timeoutFor(%d) = %v, want fixed override %v", defaultOllamaBatchSize, got, fixed)
+	}
+}
+
+// TestOllamaEmbedder_WithTimeout_IgnoresNonPositive verifies the same
+// ignore-invalid-values contract used by WithOllamaParallelism/
+// WithOllamaBatchSize: a non-positive timeout leaves the default scaling
+// behavior in place instead of disabling timeouts altogether.
+func TestOllamaEmbedder_WithTimeout_IgnoresNonPositive(t *testing.T) {
+	e := NewOllamaEmbedder(WithOllamaTimeout(0))
+
+	want := defaultOllamaMinTimeout + defaultOllamaPerTextTimeout
+	if got := e.timeoutFor(1); got != want {
+		t.Errorf("expected non-positive WithOllamaTimeout to be ignored (timeoutFor(1) = %v), got %v", want, got)
+	}
+}
+
+// TestOllamaEmbedder_EmbedRequest_SurvivesSlowBulkBatch is the core
+// regression test for the timeout bug: it spins up a test server that
+// sleeps long enough to exceed what the *old* fixed 120s-shared-by-every-
+// request-size timeout would have allowed for a proportionally slow bulk
+// request, then verifies embedRequest still succeeds because the timeout
+// scales with the number of texts in the request. It uses a short
+// perTextTimeout/minTimeout (via direct field overrides, since these
+// aren't exposed as options) so the test itself runs quickly while still
+// exercising the same scaling logic timeoutFor uses in production.
+func TestOllamaEmbedder_EmbedRequest_SurvivesSlowBulkBatch(t *testing.T) {
+	const numTexts = 8
+	sleepPerText := 20 * time.Millisecond
+	serverDelay := time.Duration(numTexts) * sleepPerText // simulates near-linear CPU-bound batch cost
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverDelay)
+		var req ollamaEmbedBatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("failed to decode request: %v", err)
+			return
+		}
+		resp := ollamaEmbedBatchResponse{Embeddings: make([][]float32, len(req.Input))}
+		for i := range resp.Embeddings {
+			resp.Embeddings[i] = []float32{float32(i)}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("failed to encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	e := NewOllamaEmbedder(WithOllamaEndpoint(server.URL))
+	// Fixed budget too small for the whole batch at once, but per-text
+	// scaling comfortably covers serverDelay -- proving the scaling (not
+	// just a generously large fixed timeout) is what makes this pass.
+	e.minTimeout = 5 * time.Millisecond
+	e.perTextTimeout = sleepPerText * 3
+
+	texts := make([]string, numTexts)
+	for i := range texts {
+		texts[i] = "text"
+	}
+
+	embeddings, err := e.embedRequest(context.Background(), texts)
+	if err != nil {
+		t.Fatalf("embedRequest failed despite timeout scaling with batch size: %v", err)
+	}
+	if len(embeddings) != numTexts {
+		t.Fatalf("expected %d embeddings, got %d", numTexts, len(embeddings))
+	}
+}
+
+// TestOllamaEmbedder_EmbedRequest_TimesOutWhenBudgetTooSmall is the inverse
+// check: with a timeout budget that's too small even after scaling, the
+// request should fail (via context deadline), rather than the scaling
+// logic silently not being applied at all.
+func TestOllamaEmbedder_EmbedRequest_TimesOutWhenBudgetTooSmall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	e := NewOllamaEmbedder(WithOllamaEndpoint(server.URL))
+	e.minTimeout = 10 * time.Millisecond
+	e.perTextTimeout = 1 * time.Millisecond
+
+	_, err := e.embedRequest(context.Background(), []string{"text", "text"})
+	if err == nil {
+		t.Fatal("expected embedRequest to fail when the scaled timeout budget is smaller than the server's response time")
+	}
+}
