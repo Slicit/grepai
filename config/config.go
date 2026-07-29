@@ -39,6 +39,8 @@ const (
 	DefaultOpenAILargeDimensions    = 3072
 	DefaultQwen8BDimensions         = 4096
 	DefaultOpenAIParallelism        = 4
+	DefaultOllamaParallelism        = 4
+	DefaultOllamaBatchSize          = 32
 
 	DefaultPostgresDSN    = "postgres://localhost:5432/grepai"
 	DefaultQdrantEndpoint = "localhost"
@@ -111,7 +113,8 @@ type EmbedderConfig struct {
 	Endpoint    string `yaml:"endpoint,omitempty"`
 	APIKey      string `yaml:"api_key,omitempty"`
 	Dimensions  *int   `yaml:"dimensions,omitempty"`
-	Parallelism int    `yaml:"parallelism"` // Number of parallel workers for batch embedding (default: 4)
+	Parallelism int    `yaml:"parallelism"`          // Number of concurrent embedding requests in flight (default: 4). Used by OpenAI and Ollama.
+	BatchSize   int    `yaml:"batch_size,omitempty"` // Number of texts bundled into a single embedding request (default: 32 for Ollama, unused by OpenAI which batches whole runs).
 }
 
 // GetDimensions returns the configured dimensions or a default value.
@@ -174,10 +177,12 @@ func DefaultEmbedderForProvider(provider string) EmbedderConfig {
 	default:
 		dim := DefaultLocalEmbeddingDimensions
 		return EmbedderConfig{
-			Provider:   providerOrDefault(provider),
-			Model:      DefaultOllamaEmbeddingModel,
-			Endpoint:   DefaultOllamaEndpoint,
-			Dimensions: &dim,
+			Provider:    providerOrDefault(provider),
+			Model:       DefaultOllamaEmbeddingModel,
+			Endpoint:    DefaultOllamaEndpoint,
+			Dimensions:  &dim,
+			Parallelism: DefaultOllamaParallelism,
+			BatchSize:   DefaultOllamaBatchSize,
 		}
 	}
 }
@@ -540,9 +545,17 @@ func (c *Config) applyDefaults() {
 		}
 	}
 
-	// Parallelism default (only used by OpenAI embedder)
+	// Parallelism default (used by OpenAI and Ollama embedders to bound
+	// concurrent requests in flight)
 	if c.Embedder.Parallelism <= 0 {
 		c.Embedder.Parallelism = 4
+	}
+
+	// BatchSize default (used by Ollama to bound how many texts are bundled
+	// into a single /api/embed request; other providers batch differently
+	// and don't read this field).
+	if c.Embedder.BatchSize <= 0 {
+		c.Embedder.BatchSize = DefaultOllamaBatchSize
 	}
 
 	// Chunking defaults

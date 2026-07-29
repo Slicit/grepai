@@ -365,6 +365,85 @@ store:
 	}
 }
 
+// TestOllamaBatchSizeConfig verifies batch_size defaults and validation for
+// the Ollama embedder, and that both parallelism and batch_size can be set
+// together to control bulk-embedding throughput.
+func TestOllamaBatchSizeConfig(t *testing.T) {
+	tests := []struct {
+		name              string
+		configYAML        string
+		expectedBatchSize int
+		expectedParallel  int
+	}{
+		{
+			name: "default batch_size is 32 when not specified",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+store:
+  backend: gob
+`,
+			expectedBatchSize: 32,
+			expectedParallel:  4,
+		},
+		{
+			name: "custom batch_size and parallelism are respected",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+  parallelism: 64
+  batch_size: 128
+store:
+  backend: gob
+`,
+			expectedBatchSize: 128,
+			expectedParallel:  64,
+		},
+		{
+			name: "batch_size of 0 defaults to 32",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+  batch_size: 0
+store:
+  backend: gob
+`,
+			expectedBatchSize: 32,
+			expectedParallel:  4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			configDir := filepath.Join(tmpDir, ConfigDir)
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				t.Fatalf("failed to create config dir: %v", err)
+			}
+
+			configPath := filepath.Join(configDir, ConfigFileName)
+			if err := os.WriteFile(configPath, []byte(tt.configYAML), 0600); err != nil {
+				t.Fatalf("failed to write config: %v", err)
+			}
+
+			loaded, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("failed to load config: %v", err)
+			}
+
+			if loaded.Embedder.BatchSize != tt.expectedBatchSize {
+				t.Errorf("expected batch_size %d, got %d", tt.expectedBatchSize, loaded.Embedder.BatchSize)
+			}
+			if loaded.Embedder.Parallelism != tt.expectedParallel {
+				t.Errorf("expected parallelism %d, got %d", tt.expectedParallel, loaded.Embedder.Parallelism)
+			}
+		})
+	}
+}
+
 // TestFindProjectRootWithSymlink verifies that FindProjectRoot resolves symlinks correctly.
 func TestFindProjectRootWithSymlink(t *testing.T) {
 	// Create a real directory with grepai config
