@@ -213,7 +213,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	// decide goroutine's g.Wait() below has returned) -- read by
 	// cumulativeBatchProgress further down to tell callers whether a given
 	// wave's TotalChunks is final or still provisional (see
-	// BatchProgressInfo.TotalIsFinal). queuedForEmbedding/reusedForEmbedding
+	// BatchProgressInfo.Provisional). queuedForEmbedding/reusedUnchangedFile
 	// track why each file was or wasn't queued, purely for the summary log
 	// once decide finishes.
 	var (
