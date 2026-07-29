@@ -987,7 +987,7 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	}
 
 	// Initialize scanner
-	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher).WithScanWorkers(cfg.Watch.ScanWorkers)
 
 	// Initialize chunker
 	chunker := indexer.NewChunker(cfg.Chunking.Size, cfg.Chunking.Overlap)
@@ -2752,7 +2752,7 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		return nil, nil, fmt.Errorf("failed to initialize ignore matcher: %w", err)
 	}
 
-	scanner := indexer.NewScanner(project.Path, ignoreMatcher)
+	scanner := indexer.NewScanner(project.Path, ignoreMatcher).WithScanWorkers(projectCfg.Watch.ScanWorkers)
 	chunker := indexer.NewChunker(projectCfg.Chunking.Size, projectCfg.Chunking.Overlap)
 	processorRegistry := buildFrameworkRegistry(projectCfg)
 	vectorStore := &projectPrefixStore{
