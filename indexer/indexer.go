@@ -47,13 +47,28 @@ type ProgressCallback func(info ProgressInfo)
 
 // BatchProgressInfo contains progress information for batch embedding
 type BatchProgressInfo struct {
-	BatchIndex      int  // Current batch index (0-indexed)
-	TotalBatches    int  // Total number of batches
-	CompletedChunks int  // Number of chunks completed so far
-	TotalChunks     int  // Total number of chunks to embed
-	Retrying        bool // True if this is a retry attempt
-	Attempt         int  // Retry attempt number (1-indexed, 0 if not retrying)
-	StatusCode      int  // HTTP status code when retrying (429 = rate limited, 5xx = server error)
+	BatchIndex      int // Current batch index (0-indexed)
+	TotalBatches    int // Total number of batches
+	CompletedChunks int // Number of chunks completed so far
+	TotalChunks     int // Total number of chunks to embed
+	// Provisional is true while the scan/decide phase is still running
+	// (see IndexAllWithBatchProgress): because embedding overlaps with
+	// scanning, TotalChunks only reflects what's been discovered so far
+	// and will keep growing as later waves of files are decided and
+	// queued. It defaults to false (matching prior behavior for any
+	// existing caller that doesn't set it) and is only set true by
+	// IndexAllWithBatchProgress itself while more waves may still be
+	// coming. Once the scan/decide phase finishes, no more waves can be
+	// added, Provisional goes back to false, and TotalChunks stops
+	// changing -- only then does CompletedChunks/TotalChunks represent
+	// real completion. Callers rendering a percentage or "done" state
+	// should treat a Provisional total as not-yet-final, since a mid-run
+	// wave completing at its own 100% is not the same as the whole run
+	// being done.
+	Provisional bool
+	Retrying    bool // True if this is a retry attempt
+	Attempt     int  // Retry attempt number (1-indexed, 0 if not retrying)
+	StatusCode  int  // HTTP status code when retrying (429 = rate limited, 5xx = server error)
 }
 
 // BatchProgressCallback is called for batch embedding progress and retry visibility
@@ -120,6 +135,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	}
 	stats.FilesSkipped = len(skipped)
 	stats.ScannedFiles = fileMetas
+	log.Printf("Scan: found %d indexable files (%d skipped as minified/too large/unreadable during scan)", len(fileMetas), len(skipped))
 
 	// Get every existing document in one bulk read, instead of one
 	// GetDocument round trip per scanned file below. On the common path of
@@ -132,6 +148,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	if err != nil {
 		return nil, fmt.Errorf("failed to list documents: %w", err)
 	}
+	log.Printf("Store: %d existing documents loaded for comparison", len(existingDocs))
 
 	existingMap := make(map[string]bool, len(existingDocs))
 	for path := range existingDocs {
@@ -192,6 +209,19 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		decideErr error // written once, before filesCh is closed; safe to read after draining filesCh (see below)
 	)
 
+	// decideComplete flips to true once every file has been decided (the
+	// decide goroutine's g.Wait() below has returned) -- read by
+	// cumulativeBatchProgress further down to tell callers whether a given
+	// wave's TotalChunks is final or still provisional (see
+	// BatchProgressInfo.TotalIsFinal). queuedForEmbedding/reusedForEmbedding
+	// track why each file was or wasn't queued, purely for the summary log
+	// once decide finishes.
+	var (
+		decideComplete      atomic.Bool
+		queuedForEmbedding  atomic.Int64
+		reusedUnchangedFile atomic.Int64
+	)
+
 	go func() {
 		defer close(filesCh)
 
@@ -214,12 +244,18 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 					})
 				}
 
-				if decision.countAsSkipped {
+				switch {
+				case decision.countAsSkipped:
 					statsMu.Lock()
 					stats.FilesSkipped++
 					statsMu.Unlock()
+				case decision.file == nil:
+					// Unchanged (same content hash, already has chunks) --
+					// reused from the existing index without re-embedding.
+					reusedUnchangedFile.Add(1)
 				}
 				if decision.file != nil {
+					queuedForEmbedding.Add(1)
 					select {
 					case filesCh <- *decision.file:
 					case <-gctx.Done():
@@ -236,6 +272,13 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		// happens-before guarantee) is what makes reading decideErr after the
 		// loop safe without extra synchronization.
 		decideErr = g.Wait()
+		decideComplete.Store(true)
+
+		statsMu.Lock()
+		skippedSoFar := stats.FilesSkipped
+		statsMu.Unlock()
+		log.Printf("Scan/decide complete: %d files need (re)indexing, %d unchanged (reused), %d skipped",
+			queuedForEmbedding.Load(), reusedUnchangedFile.Load(), skippedSoFar)
 	}()
 
 	// Wave progress is reported cumulatively across waves (prior waves'
@@ -250,6 +293,12 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		return func(info BatchProgressInfo) {
 			info.CompletedChunks += int(priorChunksCompleted.Load())
 			info.TotalChunks += int(priorChunksTotal.Load())
+			// See BatchProgressInfo.Provisional: TotalChunks above can
+			// still grow (a later wave hasn't been decided/queued yet) as
+			// long as scan/decide is still running, so callers shouldn't
+			// treat completed==total as the whole run finishing while
+			// this is true.
+			info.Provisional = !decideComplete.Load()
 			wave(info)
 		}
 	}
@@ -266,10 +315,16 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	var embedErr error
 	stopEmbedding := false
 
+	var waveNum atomic.Int64
+
 	flushWave := func(wave []FileInfo) {
 		if len(wave) == 0 || stopEmbedding {
 			return
 		}
+
+		n := waveNum.Add(1)
+		waveStart := time.Now()
+		log.Printf("Embedding wave %d: %d files queued for embedding", n, len(wave))
 
 		if hasBatchEmbedder {
 			indexed, chunks, err := idx.indexFilesBatched(ctx, wave, batchEmbedder, cumulativeBatchProgress(onBatchProgress), cp)
@@ -282,15 +337,23 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			if err != nil {
 				embedErr = err
 				stopEmbedding = true
+				log.Printf("Embedding wave %d failed after %d files / %d chunks (%s): %v",
+					n, indexed, chunks, time.Since(waveStart).Round(time.Millisecond), err)
+				return
 			}
+			log.Printf("Embedding wave %d complete: %d files indexed, %d chunks embedded (%s)",
+				n, indexed, chunks, time.Since(waveStart).Round(time.Millisecond))
 			return
 		}
 
 		// Sequential path for embedders that don't implement BatchEmbedder
 		// (e.g. LM Studio, Synthetic, OpenRouter).
+		var waveIndexed, waveChunks int
 		for _, file := range wave {
 			if ctx.Err() != nil {
 				stopEmbedding = true
+				log.Printf("Embedding wave %d interrupted after %d files / %d chunks (%s): %v",
+					n, waveIndexed, waveChunks, time.Since(waveStart).Round(time.Millisecond), ctx.Err())
 				return
 			}
 			chunks, err := idx.IndexFile(ctx, file)
@@ -303,17 +366,22 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			stats.ChunksCreated += chunks
 			statsMu.Unlock()
 			cp.fileSaved()
+			waveIndexed++
+			waveChunks += chunks
 
-			n := sequentialIndexed.Add(1)
+			cur := sequentialIndexed.Add(1)
 			if onBatchProgress != nil {
 				onBatchProgress(BatchProgressInfo{
-					BatchIndex:      int(n) - 1,
-					TotalBatches:    int(n),
-					CompletedChunks: int(n),
-					TotalChunks:     int(n),
+					BatchIndex:      int(cur) - 1,
+					TotalBatches:    int(cur),
+					CompletedChunks: int(cur),
+					TotalChunks:     int(cur),
+					Provisional:     !decideComplete.Load(),
 				})
 			}
 		}
+		log.Printf("Embedding wave %d complete: %d files indexed, %d chunks embedded (%s)",
+			n, waveIndexed, waveChunks, time.Since(waveStart).Round(time.Millisecond))
 	}
 
 	wave := make([]FileInfo, 0, embedWaveSize)
@@ -666,6 +734,12 @@ func (idx *Indexer) indexFilesBatched(
 	if len(fileChunks) == 0 {
 		return 0, 0, nil
 	}
+
+	totalChunksThisWave := 0
+	for _, fc := range fileChunks {
+		totalChunksThisWave += len(fc.Chunks)
+	}
+	log.Printf("Chunked %d files into %d chunks, checking embedding cache before sending to the embedder", len(fileChunks), totalChunksThisWave)
 
 	// Check embedding cache for content-addressed deduplication
 	cache, hasCache := idx.store.(store.EmbeddingCache)
