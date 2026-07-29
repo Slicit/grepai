@@ -2,6 +2,7 @@ package embedder
 
 import (
 	"testing"
+	"time"
 
 	"github.com/yoanbernabeu/grepai/config"
 )
@@ -62,6 +63,70 @@ func TestNewFromConfig_Ollama_ParallelismAndBatchSize(t *testing.T) {
 	}
 	if ollamaEmb.batchSize != 128 {
 		t.Errorf("expected batchSize 128, got %d", ollamaEmb.batchSize)
+	}
+}
+
+// TestNewFromConfig_Ollama_TimeoutSeconds verifies the factory wires
+// config.Embedder.TimeoutSeconds through to the Ollama embedder as a fixed
+// override of the default per-batch-size timeout scaling. This is the
+// config-level escape hatch for setups where the default scaling still
+// isn't generous (or is too generous) for a particular CPU-only install.
+func TestNewFromConfig_Ollama_TimeoutSeconds(t *testing.T) {
+	cfg := &config.Config{
+		Embedder: config.EmbedderConfig{
+			Provider:       "ollama",
+			Model:          "nomic-embed-text",
+			Endpoint:       "http://localhost:11434",
+			TimeoutSeconds: 300,
+		},
+	}
+
+	emb, err := NewFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("failed to create embedder: %v", err)
+	}
+	defer emb.Close()
+
+	ollamaEmb, ok := emb.(*OllamaEmbedder)
+	if !ok {
+		t.Fatalf("expected *OllamaEmbedder, got %T", emb)
+	}
+
+	want := 300 * time.Second
+	if got := ollamaEmb.timeoutFor(1); got != want {
+		t.Errorf("expected timeoutFor(1) to use the fixed TimeoutSeconds override (%v), got %v", want, got)
+	}
+	if got := ollamaEmb.timeoutFor(128); got != want {
+		t.Errorf("expected timeoutFor(128) to use the fixed TimeoutSeconds override (%v), got %v", want, got)
+	}
+}
+
+// TestNewFromConfig_Ollama_TimeoutSecondsZero_UsesDefaultScaling verifies
+// that leaving TimeoutSeconds unset (its zero value) leaves the default
+// per-batch-size scaling behavior in place, rather than the factory
+// accidentally passing a zero fixed timeout through.
+func TestNewFromConfig_Ollama_TimeoutSecondsZero_UsesDefaultScaling(t *testing.T) {
+	cfg := &config.Config{
+		Embedder: config.EmbedderConfig{
+			Provider: "ollama",
+			Model:    "nomic-embed-text",
+			Endpoint: "http://localhost:11434",
+		},
+	}
+
+	emb, err := NewFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("failed to create embedder: %v", err)
+	}
+	defer emb.Close()
+
+	ollamaEmb, ok := emb.(*OllamaEmbedder)
+	if !ok {
+		t.Fatalf("expected *OllamaEmbedder, got %T", emb)
+	}
+
+	if got, single := ollamaEmb.timeoutFor(1), ollamaEmb.timeoutFor(64); got >= single {
+		t.Errorf("expected timeoutFor(64) (%v) to be greater than timeoutFor(1) (%v) when no fixed override is configured", single, got)
 	}
 }
 

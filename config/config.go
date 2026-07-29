@@ -108,13 +108,14 @@ type BoostRule struct {
 }
 
 type EmbedderConfig struct {
-	Provider    string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter
-	Model       string `yaml:"model"`
-	Endpoint    string `yaml:"endpoint,omitempty"`
-	APIKey      string `yaml:"api_key,omitempty"`
-	Dimensions  *int   `yaml:"dimensions,omitempty"`
-	Parallelism int    `yaml:"parallelism"`          // Number of concurrent embedding requests in flight (default: 4). Used by OpenAI and Ollama.
-	BatchSize   int    `yaml:"batch_size,omitempty"` // Number of texts bundled into a single embedding request (default: 32 for Ollama, unused by OpenAI which batches whole runs).
+	Provider       string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter
+	Model          string `yaml:"model"`
+	Endpoint       string `yaml:"endpoint,omitempty"`
+	APIKey         string `yaml:"api_key,omitempty"`
+	Dimensions     *int   `yaml:"dimensions,omitempty"`
+	Parallelism    int    `yaml:"parallelism"`               // Number of concurrent embedding requests in flight (default: 4). Used by OpenAI and Ollama.
+	BatchSize      int    `yaml:"batch_size,omitempty"`      // Number of texts bundled into a single embedding request (default: 32 for Ollama, unused by OpenAI which batches whole runs).
+	TimeoutSeconds int    `yaml:"timeout_seconds,omitempty"` // Optional fixed HTTP request timeout in seconds for Ollama. If unset, the timeout scales automatically with batch size instead (see WithOllamaTimeout).
 }
 
 // GetDimensions returns the configured dimensions or a default value.

@@ -34,6 +34,26 @@ const (
 	// parallelism (multiple such requests in flight concurrently), this is
 	// what lets grepai saturate a GPU during indexing.
 	defaultOllamaBatchSize = 32
+
+	// defaultOllamaPerTextTimeout is added to a request's timeout budget for
+	// every text included in that /api/embed call. The old implementation
+	// used one fixed http.Client timeout (120s) shared by every request
+	// regardless of size; that was fine when each call embedded a single
+	// text (same cost as a one-off curl), but once batching sends
+	// defaultOllamaBatchSize texts per request, a CPU-only Ollama install
+	// -- which typically processes a batch close to linearly rather than
+	// getting GPU-style batch speedup -- can easily blow past a fixed 120s
+	// budget for a full batch even though a single-text request completes
+	// almost instantly. Scaling the timeout with the number of texts in the
+	// specific request keeps small requests fast-failing while giving large
+	// batches a proportionally larger budget.
+	defaultOllamaPerTextTimeout = 10 * time.Second
+
+	// defaultOllamaMinTimeout is the floor applied to every request
+	// regardless of how many texts it contains, covering fixed overhead
+	// (connection setup, the model being loaded into memory on first use,
+	// etc.) that doesn't scale with batch size.
+	defaultOllamaMinTimeout = 60 * time.Second
 )
 
 type OllamaEmbedder struct {
@@ -43,6 +63,17 @@ type OllamaEmbedder struct {
 	parallelism int
 	batchSize   int
 	client      *http.Client
+
+	// requestTimeout, if set (>0) via WithOllamaTimeout, overrides the
+	// default per-batch-size timeout scaling below with one fixed value
+	// applied to every request regardless of size.
+	requestTimeout time.Duration
+	// perTextTimeout and minTimeout implement the default scaling
+	// behavior: timeoutFor(n) == minTimeout + n*perTextTimeout. See
+	// defaultOllamaPerTextTimeout / defaultOllamaMinTimeout for why this
+	// scaling exists.
+	perTextTimeout time.Duration
+	minTimeout     time.Duration
 }
 
 // ollamaEmbedRequest targets Ollama's legacy /api/embeddings endpoint, which
@@ -116,16 +147,34 @@ func WithOllamaBatchSize(batchSize int) OllamaOption {
 	}
 }
 
+// WithOllamaTimeout overrides the HTTP request timeout with one fixed
+// value applied to every request regardless of how many texts it contains,
+// replacing the default behavior of scaling the timeout with batch size
+// (see defaultOllamaPerTextTimeout / defaultOllamaMinTimeout). Use this if
+// the default scaling still isn't generous enough for a particularly slow
+// CPU-only setup, or to pin a tighter bound on a fast one.
+func WithOllamaTimeout(timeout time.Duration) OllamaOption {
+	return func(e *OllamaEmbedder) {
+		if timeout > 0 {
+			e.requestTimeout = timeout
+		}
+	}
+}
+
 func NewOllamaEmbedder(opts ...OllamaOption) *OllamaEmbedder {
 	e := &OllamaEmbedder{
-		endpoint:    defaultOllamaEndpoint,
-		model:       defaultOllamaModel,
-		dimensions:  nomicEmbedDimensions,
-		parallelism: defaultOllamaParallelism,
-		batchSize:   defaultOllamaBatchSize,
-		client: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		endpoint:       defaultOllamaEndpoint,
+		model:          defaultOllamaModel,
+		dimensions:     nomicEmbedDimensions,
+		parallelism:    defaultOllamaParallelism,
+		batchSize:      defaultOllamaBatchSize,
+		perTextTimeout: defaultOllamaPerTextTimeout,
+		minTimeout:     defaultOllamaMinTimeout,
+		// No client-level Timeout: per-request deadlines are applied via
+		// context in timeoutFor/Embed/embedRequest instead, so the budget
+		// can scale with how many texts a given request actually carries
+		// rather than using one fixed value for every request size.
+		client: &http.Client{},
 	}
 
 	for _, opt := range opts {
@@ -133,6 +182,17 @@ func NewOllamaEmbedder(opts ...OllamaOption) *OllamaEmbedder {
 	}
 
 	return e
+}
+
+// timeoutFor returns the HTTP request timeout budget for a request
+// embedding n texts. If requestTimeout was set via WithOllamaTimeout, that
+// fixed value is used for every request regardless of n. Otherwise the
+// timeout scales with n: minTimeout + n*perTextTimeout.
+func (e *OllamaEmbedder) timeoutFor(n int) time.Duration {
+	if e.requestTimeout > 0 {
+		return e.requestTimeout
+	}
+	return e.minTimeout + time.Duration(n)*e.perTextTimeout
 }
 
 func (e *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
@@ -146,8 +206,11 @@ func (e *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float32, err
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	reqCtx, cancel := context.WithTimeout(ctx, e.timeoutFor(1))
+	defer cancel()
+
 	url := fmt.Sprintf("%s/api/embeddings", e.endpoint)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonData))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -203,8 +266,11 @@ func (e *OllamaEmbedder) embedRequest(ctx context.Context, texts []string) ([][]
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	reqCtx, cancel := context.WithTimeout(ctx, e.timeoutFor(len(texts)))
+	defer cancel()
+
 	url := fmt.Sprintf("%s/api/embed", e.endpoint)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonData))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}

@@ -2,6 +2,7 @@ package embedder
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/yoanbernabeu/grepai/config"
 )
@@ -17,6 +18,7 @@ func NewFromConfig(cfg *config.Config) (Embedder, error) {
 			WithOllamaModel(cfg.Embedder.Model),
 			WithOllamaParallelism(cfg.Embedder.Parallelism),
 			WithOllamaBatchSize(cfg.Embedder.BatchSize),
+			WithOllamaTimeout(time.Duration(cfg.Embedder.TimeoutSeconds) * time.Second),
 		}
 		if cfg.Embedder.Dimensions != nil {
 			opts = append(opts, WithOllamaDimensions(*cfg.Embedder.Dimensions))
