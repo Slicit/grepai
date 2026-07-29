@@ -145,97 +145,180 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		delete(existingMap, fileMeta.Path)
 	}
 
-	// Decide which files need (re)indexing. Each file's decision only depends
-	// on that file's own document lookup + optional content hash, so this is
-	// done concurrently across a bounded worker pool. On large repositories
-	// (100k+ files) this phase — not embedding — is often the bottleneck,
-	// especially right after a watcher restart or branch switch where every
-	// file's mtime looks "new" and must be hashed to check for real changes.
-	decisions := make([]fileScanDecision, len(fileMetas))
-	var completed atomic.Int64
+	// Decide which files need (re)indexing, and start embedding them as soon
+	// as they're found -- instead of waiting for every file in the repo to
+	// be decided first. Deciding a single file (reading it, hashing it,
+	// comparing to its existing document) has no cross-file dependency, so
+	// a producer goroutine keeps deciding files on the same bounded worker
+	// pool as before, streaming each file that needs (re)indexing into
+	// filesCh; this goroutine (the consumer) accumulates them into waves
+	// and embeds each wave as soon as it fills up. That overlap is the
+	// whole point: embedding is almost always the slowest, network-bound
+	// phase, so it can now run concurrently with scanning/deciding the rest
+	// of the repository instead of sitting idle until scanning finishes.
+	//
+	// Two things deliberately still wait for the full scan, because they
+	// inherently need it: detecting files deleted from disk (existingMap,
+	// built above from the complete file list -- you can't know a file is
+	// gone until you've seen everything that remains) and the final removal
+	// loop below. Also, batching (FormBatches) only packs chunks within a
+	// wave, not across the whole run, so a wave boundary can occasionally
+	// split what would otherwise be one larger, marginally more efficient
+	// batch. Both are minor compared to eliminating the scan-then-embed
+	// stall.
+	filesCh := make(chan FileInfo, embedWaveSize)
 
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(scanWorkerLimit())
+	var (
+		statsMu   sync.Mutex
+		decideErr error // written once, before filesCh is closed; safe to read after draining filesCh (see below)
+	)
 
-	for i := range fileMetas {
-		fileMeta := fileMetas[i]
-		doc := existingDocs[fileMeta.Path]
-		g.Go(func() error {
-			decisions[i] = idx.decideFileScan(gctx, fileMeta, doc)
+	go func() {
+		defer close(filesCh)
 
-			if onProgress != nil {
-				n := completed.Add(1)
-				onProgress(ProgressInfo{
-					Current:     int(n),
-					Total:       len(fileMetas),
-					CurrentFile: fileMeta.Path,
-				})
-			}
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(scanWorkerLimit())
+		var completed atomic.Int64
+
+		for i := range fileMetas {
+			fileMeta := fileMetas[i]
+			doc := existingDocs[fileMeta.Path]
+			g.Go(func() error {
+				decision := idx.decideFileScan(gctx, fileMeta, doc)
+
+				if onProgress != nil {
+					n := completed.Add(1)
+					onProgress(ProgressInfo{
+						Current:     int(n),
+						Total:       len(fileMetas),
+						CurrentFile: fileMeta.Path,
+					})
+				}
+
+				if decision.countAsSkipped {
+					statsMu.Lock()
+					stats.FilesSkipped++
+					statsMu.Unlock()
+				}
+				if decision.file != nil {
+					select {
+					case filesCh <- *decision.file:
+					case <-gctx.Done():
+						return gctx.Err()
+					}
+				}
+				return nil
+			})
+		}
+
+		// decideErr is written here, strictly before the deferred close(filesCh)
+		// runs -- and close() happens-before the consumer's range loop below
+		// observes the channel as closed. That ordering (Go's channel-close
+		// happens-before guarantee) is what makes reading decideErr after the
+		// loop safe without extra synchronization.
+		decideErr = g.Wait()
+	}()
+
+	// Wave progress is reported cumulatively across waves (prior waves'
+	// completed/total chunk counts are added to each new wave's numbers) so
+	// a progress bar driven by onBatchProgress keeps climbing instead of
+	// resetting to 0% every time a new wave starts embedding.
+	var priorChunksCompleted, priorChunksTotal atomic.Int64
+	cumulativeBatchProgress := func(wave BatchProgressCallback) BatchProgressCallback {
+		if wave == nil {
 			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-
-	// Collect results in original scan order for deterministic output.
-	filesToIndex := make([]FileInfo, 0, len(fileMetas))
-	for _, decision := range decisions {
-		if decision.countAsSkipped {
-			stats.FilesSkipped++
 		}
-		if decision.file != nil {
-			filesToIndex = append(filesToIndex, *decision.file)
+		return func(info BatchProgressInfo) {
+			info.CompletedChunks += int(priorChunksCompleted.Load())
+			info.TotalChunks += int(priorChunksTotal.Load())
+			wave(info)
 		}
 	}
 
-	// Index files using batch processing if available, otherwise sequentially.
-	// Both paths save each file's chunks+document as soon as that file is
-	// fully embedded (see indexFilesBatched and IndexFile), and checkpoint
-	// periodically via cp -- so on an error or a canceled context below, the
-	// stats returned still reflect everything that was actually saved, and
-	// that work is not lost even though this function is returning early.
-	if batchEmbedder, ok := idx.embedder.(embedder.BatchEmbedder); ok && len(filesToIndex) > 0 {
-		indexed, chunks, err := idx.indexFilesBatched(ctx, filesToIndex, batchEmbedder, onBatchProgress, cp)
-		stats.FilesIndexed = indexed
-		stats.ChunksCreated = chunks
-		if err != nil {
-			stats.Duration = time.Since(start)
-			return stats, err
+	batchEmbedder, hasBatchEmbedder := idx.embedder.(embedder.BatchEmbedder)
+	var sequentialIndexed atomic.Int64
+
+	// Both paths below save each file's chunks+document as soon as that file
+	// is fully embedded (see indexFilesBatched and IndexFile), and
+	// checkpoint periodically via cp -- so if embedding stops on an error or
+	// a canceled context, the stats returned still reflect everything that
+	// was actually saved, and that work is not lost even though this
+	// function is returning early.
+	var embedErr error
+	stopEmbedding := false
+
+	flushWave := func(wave []FileInfo) {
+		if len(wave) == 0 || stopEmbedding {
+			return
 		}
-	} else if len(filesToIndex) > 0 {
-		// Sequential indexing for non-batch embedders (e.g., Ollama)
-		total := len(filesToIndex)
-		for i, file := range filesToIndex {
-			if ctx.Err() != nil {
-				break
+
+		if hasBatchEmbedder {
+			indexed, chunks, err := idx.indexFilesBatched(ctx, wave, batchEmbedder, cumulativeBatchProgress(onBatchProgress), cp)
+			statsMu.Lock()
+			stats.FilesIndexed += indexed
+			stats.ChunksCreated += chunks
+			statsMu.Unlock()
+			priorChunksCompleted.Add(int64(chunks))
+			priorChunksTotal.Add(int64(chunks))
+			if err != nil {
+				embedErr = err
+				stopEmbedding = true
 			}
-			if onBatchProgress != nil {
-				onBatchProgress(BatchProgressInfo{
-					BatchIndex:      i,
-					TotalBatches:    total,
-					CompletedChunks: i,
-					TotalChunks:     total,
-				})
+			return
+		}
+
+		// Sequential path for embedders that don't implement BatchEmbedder
+		// (e.g. LM Studio, Synthetic, OpenRouter).
+		for _, file := range wave {
+			if ctx.Err() != nil {
+				stopEmbedding = true
+				return
 			}
 			chunks, err := idx.IndexFile(ctx, file)
 			if err != nil {
 				log.Printf("Failed to index %s: %v", file.Path, err)
 				continue
 			}
+			statsMu.Lock()
 			stats.FilesIndexed++
 			stats.ChunksCreated += chunks
+			statsMu.Unlock()
 			cp.fileSaved()
+
+			n := sequentialIndexed.Add(1)
+			if onBatchProgress != nil {
+				onBatchProgress(BatchProgressInfo{
+					BatchIndex:      int(n) - 1,
+					TotalBatches:    int(n),
+					CompletedChunks: int(n),
+					TotalChunks:     int(n),
+				})
+			}
 		}
-		if onBatchProgress != nil {
-			onBatchProgress(BatchProgressInfo{
-				BatchIndex:      total,
-				TotalBatches:    total,
-				CompletedChunks: total,
-				TotalChunks:     total,
-			})
+	}
+
+	wave := make([]FileInfo, 0, embedWaveSize)
+	for file := range filesCh {
+		if stopEmbedding {
+			// Keep draining so the producer goroutine (blocked sending on a
+			// full channel) can finish rather than leak.
+			continue
 		}
+		wave = append(wave, file)
+		if len(wave) >= embedWaveSize {
+			flushWave(wave)
+			wave = wave[:0]
+		}
+	}
+	flushWave(wave)
+
+	if decideErr != nil {
+		stats.Duration = time.Since(start)
+		return stats, decideErr
+	}
+	if embedErr != nil {
+		stats.Duration = time.Since(start)
+		return stats, embedErr
 	}
 
 	// Remove deleted files
@@ -303,6 +386,14 @@ func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta, doc *
 // checkpointInterval is how many newly-saved files trigger a checkpoint
 // flush to durable storage during a run (see checkpoint below).
 const checkpointInterval = 200
+
+// embedWaveSize is how many decided (needs-reindexing) files are
+// accumulated before starting to embed them, in IndexAllWithBatchProgress.
+// Smaller waves start embedding sooner (better overlap with the rest of the
+// scan/decide phase still running); larger waves let FormBatches pack
+// slightly more efficient batches. 200 mirrors checkpointInterval's
+// granularity as a reasonable default for both.
+const embedWaveSize = 200
 
 // checkpoint periodically flushes the store to durable storage during a
 // long indexing run, so a run that's stopped (Ctrl+C, crash, OOM kill) part
