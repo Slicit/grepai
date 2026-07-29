@@ -444,6 +444,81 @@ store:
 	}
 }
 
+// TestScanWorkersConfig verifies watch.scan_workers defaults and validation.
+// ScanWorkers bounds how many goroutines concurrently walk the directory
+// tree during the initial file scan (see indexer.Scanner.WithScanWorkers);
+// it's deliberately a small default rather than scaled to GOMAXPROCS since
+// the scan is bounded by filesystem syscalls, not CPU.
+func TestScanWorkersConfig(t *testing.T) {
+	tests := []struct {
+		name                string
+		configYAML          string
+		expectedScanWorkers int
+	}{
+		{
+			name: "default scan_workers is 2 when not specified",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+store:
+  backend: gob
+`,
+			expectedScanWorkers: 2,
+		},
+		{
+			name: "custom scan_workers is respected",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+store:
+  backend: gob
+watch:
+  scan_workers: 8
+`,
+			expectedScanWorkers: 8,
+		},
+		{
+			name: "scan_workers of 0 defaults to 2",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+store:
+  backend: gob
+watch:
+  scan_workers: 0
+`,
+			expectedScanWorkers: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			configDir := filepath.Join(tmpDir, ConfigDir)
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				t.Fatalf("failed to create config dir: %v", err)
+			}
+
+			configPath := filepath.Join(configDir, ConfigFileName)
+			if err := os.WriteFile(configPath, []byte(tt.configYAML), 0600); err != nil {
+				t.Fatalf("failed to write config: %v", err)
+			}
+
+			loaded, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("failed to load config: %v", err)
+			}
+
+			if loaded.Watch.ScanWorkers != tt.expectedScanWorkers {
+				t.Errorf("expected scan_workers %d, got %d", tt.expectedScanWorkers, loaded.Watch.ScanWorkers)
+			}
+		})
+	}
+}
+
 // TestFindProjectRootWithSymlink verifies that FindProjectRoot resolves symlinks correctly.
 func TestFindProjectRootWithSymlink(t *testing.T) {
 	// Create a real directory with grepai config

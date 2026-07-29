@@ -42,6 +42,14 @@ const (
 	DefaultOllamaParallelism        = 4
 	DefaultOllamaBatchSize          = 32
 
+	// DefaultScanWorkers is the default number of goroutines used to walk
+	// the directory tree concurrently during the initial file scan (see
+	// WatchConfig.ScanWorkers / indexer.Scanner.WithScanWorkers). Kept
+	// small by default since it fans out over top-level subdirectories
+	// rather than individual files, and the bottleneck it addresses is
+	// filesystem syscalls, not CPU.
+	DefaultScanWorkers = 2
+
 	DefaultPostgresDSN    = "postgres://localhost:5432/grepai"
 	DefaultQdrantEndpoint = "localhost"
 	DefaultQdrantPort     = 6334
@@ -290,6 +298,14 @@ type WatchConfig struct {
 	RPGDerivedDebounceMs        int       `yaml:"rpg_derived_debounce_ms,omitempty"`
 	RPGFullReconcileIntervalSec int       `yaml:"rpg_full_reconcile_interval_sec,omitempty"`
 	RPGMaxDirtyFilesPerBatch    int       `yaml:"rpg_max_dirty_files_per_batch,omitempty"`
+	// ScanWorkers is the number of goroutines used to concurrently walk the
+	// directory tree during the initial file scan, one per top-level
+	// subdirectory. On large codebases (tens of thousands of files), the
+	// scan is bounded by filesystem syscalls (stat/readdir), not CPU, so
+	// this is a small default (see DefaultScanWorkers) rather than
+	// something scaled to GOMAXPROCS -- raise it if scanning a very large,
+	// wide directory tree (many top-level subdirectories) on fast storage.
+	ScanWorkers int `yaml:"scan_workers,omitempty"`
 }
 
 type TraceConfig struct {
@@ -373,6 +389,7 @@ func DefaultConfig() *Config {
 			},
 		},
 		Watch: WatchConfig{
+			ScanWorkers:                 DefaultScanWorkers,
 			DebounceMs:                  500,
 			RPGPersistIntervalMs:        DefaultWatchRPGPersistIntervalMs,
 			RPGDerivedDebounceMs:        DefaultWatchRPGDerivedDebounceMs,
@@ -557,6 +574,12 @@ func (c *Config) applyDefaults() {
 	// and don't read this field).
 	if c.Embedder.BatchSize <= 0 {
 		c.Embedder.BatchSize = DefaultOllamaBatchSize
+	}
+
+	// ScanWorkers default (used to bound directory-walk concurrency during
+	// the initial file scan).
+	if c.Watch.ScanWorkers <= 0 {
+		c.Watch.ScanWorkers = DefaultScanWorkers
 	}
 
 	// Chunking defaults
