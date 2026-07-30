@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -806,16 +807,56 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	} else {
 		log.Println("Building symbol index...")
 	}
-	symbolCount := 0
+	// Building the symbol index used to be a single-threaded loop that, for
+	// every traced-language file, opened it, read its full content, and
+	// SHA-256'd it -- one file at a time -- just to find out whether it had
+	// changed at all. On a restart where nothing changed, that's still a
+	// full sequential disk read of every traced file in the repo before
+	// concluding there's nothing to do, and it blocks the watcher from
+	// reaching inotify (see runProjectWatchLoop) until it finishes. On a
+	// large repo, a slow filesystem (network mount, Docker/WSL2 bind
+	// mount), or after anything that rewrites every file's mtime at once
+	// (git checkout, rsync, a bind-mount remount --  which also silently
+	// defeats the lastIndexTime gate below for the entire repo, not just
+	// the files that actually changed), that sequential full-repo read was
+	// the difference between a restart taking seconds and one taking an
+	// hour, even with zero real changes.
+	//
+	// Two things fix that:
+	//   1. symbolStore.FastSkip is a zero-I/O gate: it compares this file's
+	//      current (size, mtime) against what was recorded the last time
+	//      its content hash was computed, entirely from data already in
+	//      memory/GOB. No file is opened for files it accepts, and unlike
+	//      lastIndexTime it's per-file, so one mtime-resetting event
+	//      elsewhere in the repo can't invalidate it for files it wasn't
+	//      applied to.
+	//   2. Files FastSkip can't rule out (new, genuinely changed, or not
+	//      yet covered by a recorded fileMeta -- e.g. right after
+	//      upgrading from a build before FastSkip existed) still need a
+	//      real read+hash to decide, but that now happens on a bounded
+	//      worker pool instead of one file at a time, using the same
+	//      concurrency policy as the vector-index scan/decide phase
+	//      (indexer.ScanWorkerLimit) -- so the worst case (everything
+	//      needs re-hashing) is bounded by wall-clock I/O latency divided
+	//      by worker count, not multiplied by file count.
 	files := stats.ScannedFiles
 
+	var candidates []indexer.FileMeta
 	for _, file := range files {
 		ext := strings.ToLower(filepath.Ext(file.Path))
 		if !isTracedLanguage(ext, tracedLanguages) {
 			continue
 		}
 
-		// Skip files that are unchanged since the last index run and already tracked.
+		if symbolStore.FastSkip(file.Path, file.Size, file.ModTime) {
+			continue
+		}
+
+		// Legacy fallback for files saved before FastSkip's per-file
+		// fileMeta existed: a single global watermark, gated on the whole
+		// repo not having any mtime-reset event since. Once FastSkip's
+		// gate above covers a file (any save after this ships), this
+		// branch stops being reached for it.
 		if !lastIndexTime.IsZero() {
 			fileModTime := time.Unix(file.ModTime, 0)
 			if (fileModTime.Before(lastIndexTime) || fileModTime.Equal(lastIndexTime)) && symbolStore.IsFileIndexed(file.Path) {
@@ -823,37 +864,60 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 			}
 		}
 
-		fileInfo, err := scanner.ScanFile(file.Path)
-		if err != nil {
-			log.Printf("Warning: failed to scan %s for symbols: %v", file.Path, err)
-			continue
-		}
-		if fileInfo == nil {
-			continue
-		}
-
-		// Skip extraction when content hash matches what we already persisted.
-		if existingHash, ok := symbolStore.GetFileContentHash(fileInfo.Path); ok && existingHash == fileInfo.Hash {
-			continue
-		}
-
-		symbols, refs, err := extractSymbolsWithFramework(ctx, extractor, fileInfo.Path, fileInfo.Content, processors...)
-		if err != nil {
-			log.Printf("Warning: failed to extract symbols from %s: %v", fileInfo.Path, err)
-			continue
-		}
-		if err := symbolStore.SaveFileWithContentHash(ctx, fileInfo.Path, fileInfo.Hash, symbols, refs); err != nil {
-			log.Printf("Warning: failed to save symbols for %s: %v", fileInfo.Path, err)
-		}
-		symbolCount += len(symbols)
+		candidates = append(candidates, file)
 	}
+
+	var symbolCount atomic.Int64
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(indexer.ScanWorkerLimit())
+	for _, file := range candidates {
+		file := file
+		g.Go(func() error {
+			fileInfo, err := scanner.ScanFile(file.Path)
+			if err != nil {
+				log.Printf("Warning: failed to scan %s for symbols: %v", file.Path, err)
+				return nil
+			}
+			if fileInfo == nil {
+				return nil
+			}
+
+			// Skip extraction when content hash matches what we already
+			// persisted -- but still refresh the recorded size/mtime, so a
+			// file whose mtime drifted (e.g. repo-wide from a checkout or
+			// rsync) without its content actually changing can reach
+			// FastSkip's zero-I/O path again on the next restart instead of
+			// paying a real read+hash every time.
+			if existingHash, ok := symbolStore.GetFileContentHash(fileInfo.Path); ok && existingHash == fileInfo.Hash {
+				symbolStore.RefreshFileMeta(fileInfo.Path, fileInfo.Size, fileInfo.ModTime)
+				return nil
+			}
+
+			symbols, refs, err := extractSymbolsWithFramework(gctx, extractor, fileInfo.Path, fileInfo.Content, processors...)
+			if err != nil {
+				log.Printf("Warning: failed to extract symbols from %s: %v", fileInfo.Path, err)
+				return nil
+			}
+			if err := symbolStore.SaveFileWithContentHash(gctx, fileInfo.Path, fileInfo.Hash, symbols, refs, fileInfo.Size, fileInfo.ModTime); err != nil {
+				log.Printf("Warning: failed to save symbols for %s: %v", fileInfo.Path, err)
+				return nil
+			}
+			symbolCount.Add(int64(len(symbols)))
+			return nil
+		})
+	}
+	// Every goroutine above only ever returns nil (errors are logged and
+	// treated as a per-file skip, matching the original loop's
+	// continue-on-error semantics) -- so this can't itself fail the run.
+	_ = g.Wait()
+
 	if err := symbolStore.Persist(ctx); err != nil {
 		log.Printf("Warning: failed to persist symbol index: %v", err)
 	}
 	if !isBackgroundChild {
-		fmt.Printf("Symbol index built: %d symbols extracted\n", symbolCount)
+		fmt.Printf("Symbol index built: %d symbols extracted\n", symbolCount.Load())
 	} else {
-		log.Printf("Symbol index built: %d symbols extracted", symbolCount)
+		log.Printf("Symbol index built: %d symbols extracted", symbolCount.Load())
 	}
 
 	return stats, nil
@@ -2130,7 +2194,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			symbols, refs, err := extractSymbolsWithFramework(ctx, extractor, fileInfo.Path, fileInfo.Content, processors...)
 			if err != nil {
 				log.Printf("Failed to extract symbols from %s: %v", event.Path, err)
-			} else if err := symbolStore.SaveFileWithContentHash(ctx, fileInfo.Path, fileInfo.Hash, symbols, refs); err != nil {
+			} else if err := symbolStore.SaveFileWithContentHash(ctx, fileInfo.Path, fileInfo.Hash, symbols, refs, fileInfo.Size, fileInfo.ModTime); err != nil {
 				log.Printf("Failed to save symbols for %s: %v", event.Path, err)
 			} else {
 				log.Printf("Extracted %d symbols from %s", len(symbols), event.Path)

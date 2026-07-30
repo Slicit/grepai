@@ -591,6 +591,14 @@ func scanWorkerLimit() int {
 	return n
 }
 
+// ScanWorkerLimit exposes scanWorkerLimit's I/O-concurrency policy to
+// callers outside this package that do their own bounded-worker-pool
+// scanning over the same repository (e.g. cli's symbol-index build phase
+// in runInitialScan) and want to match it rather than invent their own.
+func ScanWorkerLimit() int {
+	return scanWorkerLimit()
+}
+
 // fileChunkData holds chunking information for a single file during batch processing.
 type fileChunkData struct {
 	fileIndex  int // Index in the files slice (for result mapping)
