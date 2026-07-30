@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -95,7 +96,7 @@ func TestRunInitialScan_SkipsSymbolExtractionWhenContentHashMatches(t *testing.T
 			Language: "go",
 		},
 	}
-	if err := symbolStore.SaveFileWithContentHash(ctx, fileInfo.Path, fileInfo.Hash, sentinel, nil); err != nil {
+	if err := symbolStore.SaveFileWithContentHash(ctx, fileInfo.Path, fileInfo.Hash, sentinel, nil, fileInfo.Size, fileInfo.ModTime); err != nil {
 		t.Fatalf("failed to seed symbol store: %v", err)
 	}
 
@@ -564,5 +565,127 @@ func TestEmitInitialStatsSnapshot_ReportsExistingTotals(t *testing.T) {
 	}
 	if !got.Snapshot {
 		t.Fatal("expected snapshot delta to be marked as Snapshot")
+	}
+}
+
+// TestRunInitialScan_RestartWithNoChangesSkipsEveryFileViaFastSkip is the
+// regression test for the "restarting the watcher can take an hour even
+// though nothing changed" symptom: the symbol-index build phase used to
+// re-read and re-hash every traced file sequentially on every restart, and
+// on a repo with many files (or a slow filesystem) that dominated startup
+// time even when nothing needed re-indexing.
+//
+// This builds a repo with many files, runs runInitialScan once (a cold
+// build), then runs it again against the same symbolStore/scanner (a
+// simulated restart with zero changes) and asserts every file's symbols
+// survive untouched and no new extraction happens -- i.e. FastSkip (backed
+// by the per-file size/mtime recorded during the first run) correctly
+// short-circuits every single file on the second pass without needing
+// lastIndexTime at all (passed as zero here, matching a fresh process that
+// hasn't loaded any config watermark yet).
+func TestRunInitialScan_RestartWithNoChangesSkipsEveryFileViaFastSkip(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+
+	const fileCount = 40
+	for i := 0; i < fileCount; i++ {
+		path := filepath.Join(projectRoot, fmt.Sprintf("file%03d.go", i))
+		content := fmt.Sprintf("package main\n\nfunc F%03d() {}\n", i)
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatalf("failed to create %s: %v", path, err)
+		}
+	}
+
+	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	chunker := indexer.NewChunker(512, 50)
+	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
+	idx := indexer.NewIndexer(projectRoot, vecStore, &noOpEmbedder{}, chunker, scanner, time.Time{})
+
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
+	if err := symbolStore.Load(ctx); err != nil {
+		t.Fatalf("failed to load symbol store: %v", err)
+	}
+	defer symbolStore.Close()
+
+	extractor := trace.NewRegexExtractor()
+
+	// Cold build: every file needs real extraction.
+	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, time.Time{}, true, nil, nil); err != nil {
+		t.Fatalf("first runInitialScan failed: %v", err)
+	}
+
+	for i := 0; i < fileCount; i++ {
+		name := fmt.Sprintf("F%03d", i)
+		syms, err := symbolStore.LookupSymbol(ctx, name)
+		if err != nil {
+			t.Fatalf("LookupSymbol(%s) failed: %v", name, err)
+		}
+		if len(syms) == 0 {
+			t.Fatalf("expected %s to be indexed after the first run", name)
+		}
+	}
+
+	// Confirm FastSkip actually recorded every file -- if it hadn't, the
+	// second run below would silently fall through to a real re-hash for
+	// everything and this test would still pass, defeating its purpose.
+	for i := 0; i < fileCount; i++ {
+		relPath := fmt.Sprintf("file%03d.go", i)
+		fileInfo, err := scanner.ScanFile(relPath)
+		if err != nil || fileInfo == nil {
+			t.Fatalf("failed to scan %s for verification: %v", relPath, err)
+		}
+		if !symbolStore.FastSkip(relPath, fileInfo.Size, fileInfo.ModTime) {
+			t.Fatalf("expected FastSkip to match %s after the first run recorded its size/mtime", relPath)
+		}
+	}
+
+	// Seed a sentinel per file so we can detect any unwanted re-extraction:
+	// re-extraction would call SaveFileWithContentHash, which replaces a
+	// file's whole symbol set -- so if the sentinel survives, that file was
+	// never re-extracted on the "restart" below.
+	for i := 0; i < fileCount; i++ {
+		relPath := fmt.Sprintf("file%03d.go", i)
+		hash, ok := symbolStore.GetFileContentHash(relPath)
+		if !ok {
+			t.Fatalf("expected a stored content hash for %s", relPath)
+		}
+		sentinel := []trace.Symbol{{
+			Name:     fmt.Sprintf("Sentinel%03d", i),
+			Kind:     trace.KindFunction,
+			File:     relPath,
+			Line:     1,
+			Language: "go",
+		}}
+		fileInfo, err := scanner.ScanFile(relPath)
+		if err != nil || fileInfo == nil {
+			t.Fatalf("failed to scan %s: %v", relPath, err)
+		}
+		if err := symbolStore.SaveFileWithContentHash(ctx, relPath, hash, sentinel, nil, fileInfo.Size, fileInfo.ModTime); err != nil {
+			t.Fatalf("failed to seed sentinel for %s: %v", relPath, err)
+		}
+	}
+
+	// Simulated restart: same files, same store, zero changes, and
+	// lastIndexTime passed as zero (as if the config watermark were
+	// unavailable) -- FastSkip must be the thing that saves this, not the
+	// legacy lastIndexTime gate.
+	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, time.Time{}, true, nil, nil); err != nil {
+		t.Fatalf("second runInitialScan failed: %v", err)
+	}
+
+	for i := 0; i < fileCount; i++ {
+		relPath := fmt.Sprintf("file%03d.go", i)
+		name := fmt.Sprintf("Sentinel%03d", i)
+		syms, err := symbolStore.LookupSymbol(ctx, name)
+		if err != nil {
+			t.Fatalf("LookupSymbol(%s) failed: %v", name, err)
+		}
+		if len(syms) == 0 {
+			t.Fatalf("expected sentinel for %s to survive the no-op restart (FastSkip should have prevented re-extraction)", relPath)
+		}
 	}
 }
