@@ -107,8 +107,12 @@ func TestIndexFilesBatched_PartialBatchFailureSavesCompletedFiles(t *testing.T) 
 	// gets a chance to embed.
 	mockEmb := &mockBatchEmbedder{failAfter: 1}
 	cp := newCheckpoint(context.Background(), idx)
+	saver := newAsyncSaver(context.Background(), idx, cp, nil)
 
-	filesIndexed, chunksCreated, err := idx.indexFilesBatched(context.Background(), files, mockEmb, nil, cp)
+	filesIndexed, chunksCreated, err := idx.indexFilesBatched(context.Background(), files, mockEmb, nil, saver, nil)
+	if saveErr := saver.closeAndWait(); saveErr != nil {
+		t.Fatalf("saver failed: %v", saveErr)
+	}
 	if err == nil {
 		t.Fatal("expected an error from the simulated interruption")
 	}

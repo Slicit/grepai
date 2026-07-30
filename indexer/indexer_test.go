@@ -585,8 +585,8 @@ func (m *mockBatchEmbedder) EmbedBatches(ctx context.Context, batches []embedder
 	return results, nil
 }
 
-// TestProgressTracking_AccurateChunkProgress tests that progress accurately reflects chunk completion
-func TestProgressTracking_AccurateChunkProgress(t *testing.T) {
+// TestProgressTracking_AccurateFileProgress tests that progress accurately reflects file completion
+func TestProgressTracking_AccurateFileProgress(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create multiple test files to generate multiple chunks
@@ -633,14 +633,14 @@ func TestProgressTracking_AccurateChunkProgress(t *testing.T) {
 
 	// Verify final progress shows 100%
 	finalProgress := progressUpdates[len(progressUpdates)-1]
-	if finalProgress.CompletedChunks != finalProgress.TotalChunks {
-		t.Errorf("final progress should show all chunks completed: got %d/%d",
-			finalProgress.CompletedChunks, finalProgress.TotalChunks)
+	if finalProgress.CompletedFiles != finalProgress.TotalFiles {
+		t.Errorf("final progress should show all files completed: got %d/%d",
+			finalProgress.CompletedFiles, finalProgress.TotalFiles)
 	}
 
-	// Verify total chunks is accurate
-	if finalProgress.TotalChunks == 0 {
-		t.Error("total chunks should be greater than 0")
+	// Verify total files is accurate
+	if finalProgress.TotalFiles == 0 {
+		t.Error("total files should be greater than 0")
 	}
 }
 
@@ -668,13 +668,13 @@ func TestProgressTracking_MonotonicallyIncreasing(t *testing.T) {
 	indexer := NewIndexer(tmpDir, mockStore, mockEmb, chunker, scanner, time.Time{})
 
 	// Track progress updates
-	var completedChunksCounts []int
+	var completedFilesCounts []int
 	var mu sync.Mutex
 
 	_, err = indexer.IndexAllWithBatchProgress(context.Background(), nil,
 		func(info BatchProgressInfo) {
 			mu.Lock()
-			completedChunksCounts = append(completedChunksCounts, info.CompletedChunks)
+			completedFilesCounts = append(completedFilesCounts, info.CompletedFiles)
 			mu.Unlock()
 		})
 	if err != nil {
@@ -685,10 +685,10 @@ func TestProgressTracking_MonotonicallyIncreasing(t *testing.T) {
 	defer mu.Unlock()
 
 	// Verify progress is monotonically increasing
-	for i := 1; i < len(completedChunksCounts); i++ {
-		if completedChunksCounts[i] < completedChunksCounts[i-1] {
+	for i := 1; i < len(completedFilesCounts); i++ {
+		if completedFilesCounts[i] < completedFilesCounts[i-1] {
 			t.Errorf("progress decreased: %d at index %d < %d at index %d",
-				completedChunksCounts[i], i, completedChunksCounts[i-1], i-1)
+				completedFilesCounts[i], i, completedFilesCounts[i-1], i-1)
 		}
 	}
 }
@@ -721,17 +721,17 @@ func TestProgressTracking_ConcurrentBatches(t *testing.T) {
 	// Track progress updates with atomic counter
 	var progressCallCount atomic.Int32
 	var maxCompleted atomic.Int32
-	var totalChunksReported atomic.Int32
+	var totalFilesReported atomic.Int32
 
 	_, err = indexer.IndexAllWithBatchProgress(context.Background(), nil,
 		func(info BatchProgressInfo) {
 			progressCallCount.Add(1)
 
 			// Track max completed and total
-			if int32(info.CompletedChunks) > maxCompleted.Load() {
-				maxCompleted.Store(int32(info.CompletedChunks))
+			if int32(info.CompletedFiles) > maxCompleted.Load() {
+				maxCompleted.Store(int32(info.CompletedFiles))
 			}
-			totalChunksReported.Store(int32(info.TotalChunks))
+			totalFilesReported.Store(int32(info.TotalFiles))
 		})
 	if err != nil {
 		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)
@@ -742,10 +742,10 @@ func TestProgressTracking_ConcurrentBatches(t *testing.T) {
 		t.Fatal("expected progress updates, got none")
 	}
 
-	// Verify final max equals total (all chunks completed)
-	if maxCompleted.Load() != totalChunksReported.Load() {
-		t.Errorf("max completed %d should equal total chunks %d",
-			maxCompleted.Load(), totalChunksReported.Load())
+	// Verify final max equals total (all files completed)
+	if maxCompleted.Load() != totalFilesReported.Load() {
+		t.Errorf("max completed %d should equal total files %d",
+			maxCompleted.Load(), totalFilesReported.Load())
 	}
 }
 
@@ -963,7 +963,7 @@ func TestCreateStoreChunks(t *testing.T) {
 	})
 }
 
-func TestSaveFileData(t *testing.T) {
+func TestAsyncSaver(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("saves chunks and document", func(t *testing.T) {
@@ -982,9 +982,16 @@ func TestSaveFileData(t *testing.T) {
 		}
 		chunkIDs := []string{"chunk1"}
 
-		err := indexer.saveFileData(ctx, fd, chunks, chunkIDs)
-		if err != nil {
-			t.Fatalf("saveFileData failed: %v", err)
+		var savedFiles, savedChunks int
+		saver := newAsyncSaver(ctx, indexer, nil, func(files, chunkCount int) {
+			savedFiles += files
+			savedChunks += chunkCount
+		})
+		if err := saver.enqueue(ctx, saveJob{fd: fd, chunks: chunks, chunkIDs: chunkIDs}); err != nil {
+			t.Fatalf("enqueue failed: %v", err)
+		}
+		if err := saver.closeAndWait(); err != nil {
+			t.Fatalf("saver failed: %v", err)
 		}
 
 		if !mockStore.saveChunksCalled {
@@ -992,6 +999,9 @@ func TestSaveFileData(t *testing.T) {
 		}
 		if !mockStore.saveDocCalled {
 			t.Error("expected SaveDocument to be called")
+		}
+		if savedFiles != 1 || savedChunks != 1 {
+			t.Errorf("onSaved reported %d files / %d chunks, expected 1/1", savedFiles, savedChunks)
 		}
 
 		// Verify document was saved correctly
@@ -1006,6 +1016,36 @@ func TestSaveFileData(t *testing.T) {
 			t.Errorf("doc.ChunkIDs = %v, expected [chunk1]", doc.ChunkIDs)
 		}
 	})
+
+	t.Run("coalesces queued files into one bulk SaveChunks call", func(t *testing.T) {
+		mockStore := newMockStore()
+		indexer := &Indexer{store: mockStore}
+
+		saver := newAsyncSaver(ctx, indexer, nil, nil)
+		for i := 0; i < 10; i++ {
+			path := fmt.Sprintf("file%d.go", i)
+			id := fmt.Sprintf("chunk%d", i)
+			job := saveJob{
+				fd:       fileChunkData{file: FileInfo{Path: path, Hash: "h"}},
+				chunks:   []store.Chunk{{ID: id, FilePath: path}},
+				chunkIDs: []string{id},
+			}
+			if err := saver.enqueue(ctx, job); err != nil {
+				t.Fatalf("enqueue failed: %v", err)
+			}
+		}
+		if err := saver.closeAndWait(); err != nil {
+			t.Fatalf("saver failed: %v", err)
+		}
+
+		mockStore.mu.Lock()
+		docs := len(mockStore.documents)
+		chunkCount := len(mockStore.chunks)
+		mockStore.mu.Unlock()
+		if docs != 10 || chunkCount != 10 {
+			t.Fatalf("expected 10 documents and 10 chunks saved, got %d/%d", docs, chunkCount)
+		}
+	})
 }
 
 func TestWrapBatchProgress(t *testing.T) {
@@ -1016,10 +1056,10 @@ func TestWrapBatchProgress(t *testing.T) {
 		}
 	})
 
-	t.Run("wraps callback correctly", func(t *testing.T) {
-		var receivedInfo BatchProgressInfo
+	t.Run("forwards only retry notifications", func(t *testing.T) {
+		var received []BatchProgressInfo
 		callback := func(info BatchProgressInfo) {
-			receivedInfo = info
+			received = append(received, info)
 		}
 
 		wrapped := wrapBatchProgress(callback)
@@ -1027,21 +1067,24 @@ func TestWrapBatchProgress(t *testing.T) {
 			t.Fatal("expected non-nil wrapped callback")
 		}
 
-		// Call the wrapped function
-		wrapped(1, 5, 100, 500, true, 2, 429)
+		// Plain chunk-level progress no longer drives the bar (file
+		// completion does) and must be dropped.
+		wrapped(0, 5, 100, 500, false, 0, 0)
+		if len(received) != 0 {
+			t.Fatalf("expected non-retry progress to be dropped, got %d update(s)", len(received))
+		}
 
-		// Verify all fields were passed through
+		// Retry notifications must pass through with their retry fields.
+		wrapped(1, 5, 100, 500, true, 2, 429)
+		if len(received) != 1 {
+			t.Fatalf("expected exactly one retry update, got %d", len(received))
+		}
+		receivedInfo := received[0]
 		if receivedInfo.BatchIndex != 1 {
 			t.Errorf("BatchIndex = %d, expected 1", receivedInfo.BatchIndex)
 		}
 		if receivedInfo.TotalBatches != 5 {
 			t.Errorf("TotalBatches = %d, expected 5", receivedInfo.TotalBatches)
-		}
-		if receivedInfo.CompletedChunks != 100 {
-			t.Errorf("CompletedChunks = %d, expected 100", receivedInfo.CompletedChunks)
-		}
-		if receivedInfo.TotalChunks != 500 {
-			t.Errorf("TotalChunks = %d, expected 500", receivedInfo.TotalChunks)
 		}
 		if !receivedInfo.Retrying {
 			t.Error("Retrying = false, expected true")

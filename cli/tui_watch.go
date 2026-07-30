@@ -1195,10 +1195,13 @@ func runWatchUIWorker(ctx context.Context, p *tea.Program) (err error) {
 		}),
 		withWatchSupervisorEmbedObserver(func(info indexer.BatchProgressInfo) {
 			p.Send(watchUIEmbedMsg{
-				completed: info.CompletedChunks,
-				total:     info.TotalChunks,
+				completed: info.CompletedFiles,
+				total:     info.TotalFiles,
+				retrying:  info.Retrying,
+				attempt:   info.Attempt,
+				status:    info.StatusCode,
 			})
-			if info.TotalChunks > 0 && info.CompletedChunks < info.TotalChunks {
+			if info.TotalFiles > 0 && info.CompletedFiles < info.TotalFiles {
 				p.Send(watchUIPhaseMsg{current: 2}) // Embedding
 			}
 		}),

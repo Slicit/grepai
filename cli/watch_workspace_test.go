@@ -274,23 +274,19 @@ func TestPrintProgressAndBatchProgress(t *testing.T) {
 		Attempt:    2,
 	})
 	printBatchProgress(indexer.BatchProgressInfo{
-		Retrying:        false,
-		TotalChunks:     10,
-		CompletedChunks: 5,
+		Retrying:       false,
+		TotalFiles:     10,
+		CompletedFiles: 5,
 	})
 }
 
-// TestPrintBatchProgress_ProvisionalVsFinal is the regression test for the
-// fix to a misleading progress display: because embedding overlaps with
-// scan/decide (see indexer.IndexAllWithBatchProgress), TotalChunks can grow
-// across waves, and rendering every update as a normal percentage bar made
-// a run look like it repeatedly hit 100% and restarted (e.g. 1557/1557,
-// then 2555/2555, then climbing again) instead of steadily progressing
-// toward one real total. printBatchProgress must render an open-ended
-// count (no bar, no percentage) while info.Provisional is true, and only
-// switch to the normal "[bar] X% (completed/total)" form once
-// Provisional is false.
-func TestPrintBatchProgress_ProvisionalVsFinal(t *testing.T) {
+// TestPrintBatchProgress_FilesWithPercentage verifies the embed progress
+// line counts files (not chunks) and always renders a percentage bar --
+// including while info.Provisional is true: the total can still grow then,
+// but files are counted against the running total so the bar keeps
+// climbing steadily instead of repeatedly hitting 100% and restarting the
+// way per-wave chunk counting did.
+func TestPrintBatchProgress_FilesWithPercentage(t *testing.T) {
 	oldNoUI := watchNoUI
 	watchNoUI = true
 	defer func() { watchNoUI = oldNoUI }()
@@ -315,27 +311,27 @@ func TestPrintBatchProgress_ProvisionalVsFinal(t *testing.T) {
 
 	provisionalOut := capture(func() {
 		printBatchProgress(indexer.BatchProgressInfo{
-			TotalChunks:     3044,
-			CompletedChunks: 2926,
-			Provisional:     true,
+			TotalFiles:     200,
+			CompletedFiles: 50,
+			Provisional:    true,
 		})
 	})
-	if strings.Contains(provisionalOut, "[") || strings.Contains(provisionalOut, "%") {
-		t.Errorf("expected a provisional update to avoid a bar/percentage (since the total may still grow), got %q", provisionalOut)
+	if !strings.Contains(provisionalOut, "Embedding [") || !strings.Contains(provisionalOut, "25%") {
+		t.Errorf("expected a provisional update to render the percentage bar, got %q", provisionalOut)
 	}
-	if !strings.Contains(provisionalOut, "2926") || !strings.Contains(provisionalOut, "3044") {
-		t.Errorf("expected the provisional update to still report the counts so far, got %q", provisionalOut)
+	if !strings.Contains(provisionalOut, "50/200 files") {
+		t.Errorf("expected the update to report file counts, got %q", provisionalOut)
 	}
 
 	finalOut := capture(func() {
 		printBatchProgress(indexer.BatchProgressInfo{
-			TotalChunks:     3044,
-			CompletedChunks: 3044,
-			Provisional:     false,
+			TotalFiles:     200,
+			CompletedFiles: 200,
+			Provisional:    false,
 		})
 	})
-	if !strings.Contains(finalOut, "Embedding [") || !strings.Contains(finalOut, "100%") {
-		t.Errorf("expected a final (non-provisional) update to render the normal percentage bar, got %q", finalOut)
+	if !strings.Contains(finalOut, "Embedding [") || !strings.Contains(finalOut, "100%") || !strings.Contains(finalOut, "200/200 files") {
+		t.Errorf("expected a final update to render the full percentage bar with file counts, got %q", finalOut)
 	}
 }
 
@@ -355,9 +351,9 @@ func TestPrintProgressAndBatchProgress_NoUIModeUsesNewlines(t *testing.T) {
 
 	printProgress(1, 2, filepath.Join("very", "long", "path", "to", "file.go"))
 	printBatchProgress(indexer.BatchProgressInfo{
-		Retrying:        false,
-		TotalChunks:     10,
-		CompletedChunks: 5,
+		Retrying:       false,
+		TotalFiles:     10,
+		CompletedFiles: 5,
 	})
 
 	_ = w.Close()

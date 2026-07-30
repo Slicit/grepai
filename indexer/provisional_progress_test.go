@@ -9,13 +9,10 @@ import (
 
 // TestIndexAllWithBatchProgress_ProvisionalUntilDecideCompletes is the
 // regression test for the fix to a misleading progress display: because
-// embedding overlaps with scan/decide, a wave's own TotalChunks isn't the
-// grand total for the whole run until scan/decide has finished discovering
-// every file that needs (re)indexing. Before this fix, every
-// BatchProgressInfo update looked equally "final" to a caller, which made
-// a multi-wave run appear to repeatedly hit 100% and then grow again
-// (e.g. 1557/1557, then 2555/2555, then climbing) instead of steadily
-// progressing toward one real total.
+// embedding overlaps with scan/decide, TotalFiles isn't the grand total
+// for the whole run until scan/decide has finished discovering every file
+// that needs (re)indexing. The Provisional flag is what tells a caller
+// whether the reported total is still growing or final.
 //
 // This test asserts: at least one progress update during a multi-wave run
 // has Provisional == true (proving the flag is actually used, not just
@@ -83,12 +80,11 @@ func TestIndexAllWithBatchProgress_ProvisionalUntilDecideCompletes(t *testing.T)
 	}
 }
 
-// TestIndexAllWithBatchProgress_TotalChunksNeverDecreases guards against a
-// regression in the cumulative wave counting: the reported TotalChunks
-// must never go down between successive updates, even though it's allowed
-// to grow (that's the whole point of overlapping scan/decide with
-// embedding).
-func TestIndexAllWithBatchProgress_TotalChunksNeverDecreases(t *testing.T) {
+// TestIndexAllWithBatchProgress_TotalFilesNeverDecreases guards against a
+// regression in the progress counting: the reported TotalFiles must never
+// go down between successive updates, even though it's allowed to grow
+// (that's the whole point of overlapping scan/decide with embedding).
+func TestIndexAllWithBatchProgress_TotalFilesNeverDecreases(t *testing.T) {
 	tmpDir := t.TempDir()
 	const totalFiles = embedWaveSize * 3
 	writeTinyFiles(t, tmpDir, totalFiles)
@@ -112,10 +108,10 @@ func TestIndexAllWithBatchProgress_TotalChunksNeverDecreases(t *testing.T) {
 	_, err = idx.IndexAllWithBatchProgress(context.Background(), nil, func(info BatchProgressInfo) {
 		mu.Lock()
 		defer mu.Unlock()
-		if info.TotalChunks < lastSeen {
-			t.Errorf("TotalChunks decreased: was %d, now %d", lastSeen, info.TotalChunks)
+		if info.TotalFiles < lastSeen {
+			t.Errorf("TotalFiles decreased: was %d, now %d", lastSeen, info.TotalFiles)
 		}
-		lastSeen = info.TotalChunks
+		lastSeen = info.TotalFiles
 	})
 	if err != nil {
 		t.Fatalf("IndexAllWithBatchProgress failed: %v", err)

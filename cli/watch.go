@@ -2249,28 +2249,22 @@ func printBatchProgress(info indexer.BatchProgressInfo) {
 		watchProgressOutput.println(fmt.Sprintf("%s - Retrying batch %d (attempt %d/5)...", reason, info.BatchIndex+1, info.Attempt))
 		return
 	}
-	if info.TotalChunks <= 0 {
+	if info.TotalFiles <= 0 {
 		return
 	}
 
-	// While Provisional is true, scanning/deciding is still discovering
-	// more files to embed, so TotalChunks will keep growing -- rendering
-	// it as a normal percentage bar would make the run look like it
-	// repeatedly hits 100% and restarts (e.g. 1557/1557, then 2555/2555,
-	// then climbing again) instead of steadily progressing toward one
-	// real total. Show an open-ended count instead until the total is
-	// known to be final.
-	if info.Provisional {
-		watchProgressOutput.render(fmt.Sprintf("Embedding: %d chunks embedded so far (%d queued, still scanning for more)...",
-			info.CompletedChunks, info.TotalChunks))
-		return
-	}
-
-	percentage := float64(info.CompletedChunks) / float64(info.TotalChunks) * 100
+	// Progress is counted in files, like the scan bar: TotalFiles is final
+	// as soon as scan/decide completes (and only grows before that, while
+	// info.Provisional is true), so the bar and percentage always climb
+	// toward a stable 100% instead of repeatedly hitting it and resetting.
+	percentage := float64(info.CompletedFiles) / float64(info.TotalFiles) * 100
 	barWidth := 20
-	filled := int(float64(barWidth) * float64(info.CompletedChunks) / float64(info.TotalChunks))
+	filled := int(float64(barWidth) * float64(info.CompletedFiles) / float64(info.TotalFiles))
+	if filled > barWidth {
+		filled = barWidth
+	}
 	bar := strings.Repeat("\u2588", filled) + strings.Repeat("\u2591", barWidth-filled)
-	watchProgressOutput.render(fmt.Sprintf("Embedding [%s] %3.0f%% (%d/%d)", bar, percentage, info.CompletedChunks, info.TotalChunks))
+	watchProgressOutput.render(fmt.Sprintf("Embedding [%s] %3.0f%% (%d/%d files)", bar, percentage, info.CompletedFiles, info.TotalFiles))
 }
 
 func (r *watchProgressRenderer) render(line string) {

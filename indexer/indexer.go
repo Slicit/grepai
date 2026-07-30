@@ -45,26 +45,25 @@ type ProgressInfo struct {
 // ProgressCallback is called for each file during indexing
 type ProgressCallback func(info ProgressInfo)
 
-// BatchProgressInfo contains progress information for batch embedding
+// BatchProgressInfo contains progress information for the embed phase.
+//
+// Progress is counted in files, matching the scan phase: TotalFiles is the
+// number of files queued for (re)embedding and CompletedFiles is how many
+// of those have every one of their chunks embedded. Files are what the
+// user sees everywhere else (scan progress, stats, logs), and the total is
+// known as soon as scan/decide finishes, so a percentage can be rendered
+// against a stable 100%.
 type BatchProgressInfo struct {
-	BatchIndex      int // Current batch index (0-indexed)
-	TotalBatches    int // Total number of batches
-	CompletedChunks int // Number of chunks completed so far
-	TotalChunks     int // Total number of chunks to embed
+	BatchIndex     int // Batch index (0-indexed); only meaningful on Retrying updates
+	TotalBatches   int // Total number of batches; only meaningful on Retrying updates
+	CompletedFiles int // Number of files fully embedded so far
+	TotalFiles     int // Total number of files queued for embedding so far
 	// Provisional is true while the scan/decide phase is still running
 	// (see IndexAllWithBatchProgress): because embedding overlaps with
-	// scanning, TotalChunks only reflects what's been discovered so far
-	// and will keep growing as later waves of files are decided and
-	// queued. It defaults to false (matching prior behavior for any
-	// existing caller that doesn't set it) and is only set true by
-	// IndexAllWithBatchProgress itself while more waves may still be
-	// coming. Once the scan/decide phase finishes, no more waves can be
-	// added, Provisional goes back to false, and TotalChunks stops
-	// changing -- only then does CompletedChunks/TotalChunks represent
-	// real completion. Callers rendering a percentage or "done" state
-	// should treat a Provisional total as not-yet-final, since a mid-run
-	// wave completing at its own 100% is not the same as the whole run
-	// being done.
+	// scanning, TotalFiles only reflects what's been queued so far and
+	// can keep growing until scan/decide finishes. Once it flips to
+	// false, TotalFiles is final and CompletedFiles/TotalFiles
+	// represents real completion.
 	Provisional bool
 	Retrying    bool // True if this is a retry attempt
 	Attempt     int  // Retry attempt number (1-indexed, 0 if not retrying)
@@ -211,11 +210,12 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 
 	// decideComplete flips to true once every file has been decided (the
 	// decide goroutine's g.Wait() below has returned) -- read by
-	// cumulativeBatchProgress further down to tell callers whether a given
-	// wave's TotalChunks is final or still provisional (see
-	// BatchProgressInfo.Provisional). queuedForEmbedding/reusedUnchangedFile
-	// track why each file was or wasn't queued, purely for the summary log
-	// once decide finishes.
+	// progressWithCounts further down to tell callers whether TotalFiles
+	// is final or still provisional (see BatchProgressInfo.Provisional).
+	// queuedForEmbedding doubles as the embed progress total: it counts
+	// every file queued for (re)embedding. reusedUnchangedFile tracks why
+	// a file wasn't queued, purely for the summary log once decide
+	// finishes.
 	var (
 		decideComplete      atomic.Bool
 		queuedForEmbedding  atomic.Int64
@@ -281,37 +281,57 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			queuedForEmbedding.Load(), reusedUnchangedFile.Load(), skippedSoFar)
 	}()
 
-	// Wave progress is reported cumulatively across waves (prior waves'
-	// completed/total chunk counts are added to each new wave's numbers) so
-	// a progress bar driven by onBatchProgress keeps climbing instead of
-	// resetting to 0% every time a new wave starts embedding.
-	var priorChunksCompleted, priorChunksTotal atomic.Int64
-	cumulativeBatchProgress := func(wave BatchProgressCallback) BatchProgressCallback {
-		if wave == nil {
-			return nil
+	// Embed progress is counted in files, like the scan phase: TotalFiles
+	// is how many files have been queued for (re)embedding so far (final
+	// once scan/decide completes -- see Provisional) and CompletedFiles is
+	// how many of those have every chunk embedded. progressWithCounts
+	// stamps the current counters onto every update -- including retry
+	// notifications coming back from the embedder -- so callers always
+	// render one monotonic files-based bar.
+	var filesEmbedded atomic.Int64
+	var progressMu sync.Mutex // serializes updates so counts are never delivered out of order
+	progressWithCounts := func(info BatchProgressInfo) {
+		if onBatchProgress == nil {
+			return
 		}
-		return func(info BatchProgressInfo) {
-			info.CompletedChunks += int(priorChunksCompleted.Load())
-			info.TotalChunks += int(priorChunksTotal.Load())
-			// See BatchProgressInfo.Provisional: TotalChunks above can
-			// still grow (a later wave hasn't been decided/queued yet) as
-			// long as scan/decide is still running, so callers shouldn't
-			// treat completed==total as the whole run finishing while
-			// this is true.
-			info.Provisional = !decideComplete.Load()
-			wave(info)
-		}
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		info.CompletedFiles = int(filesEmbedded.Load())
+		info.TotalFiles = int(queuedForEmbedding.Load())
+		info.Provisional = !decideComplete.Load()
+		onBatchProgress(info)
+	}
+	onFileEmbedded := func() {
+		filesEmbedded.Add(1)
+		progressWithCounts(BatchProgressInfo{})
 	}
 
-	batchEmbedder, hasBatchEmbedder := idx.embedder.(embedder.BatchEmbedder)
-	var sequentialIndexed atomic.Int64
+	// All store writes on the batch path (chunk upserts + document saves)
+	// go through a single background saver goroutine instead of happening
+	// inline on the embedding workers. On remote backends (Qdrant
+	// especially) a store write is a blocking network round trip: doing it
+	// inline meant every embed worker that finished a file sat waiting on
+	// the store, and each wave stalled on its tail of saves before the
+	// next wave could start embedding -- leaving the embedder (Ollama)
+	// idle exactly when it was ready to go fast. Decoupled, embedding runs
+	// flat out while the saver drains writes in the background, coalescing
+	// whatever has queued up into bulk SaveChunks calls (one upsert for
+	// many files instead of one round trip per file).
+	saver := newAsyncSaver(ctx, idx, cp, func(files, chunks int) {
+		statsMu.Lock()
+		stats.FilesIndexed += files
+		stats.ChunksCreated += chunks
+		statsMu.Unlock()
+	})
 
-	// Both paths below save each file's chunks+document as soon as that file
-	// is fully embedded (see indexFilesBatched and IndexFile), and
-	// checkpoint periodically via cp -- so if embedding stops on an error or
-	// a canceled context, the stats returned still reflect everything that
-	// was actually saved, and that work is not lost even though this
-	// function is returning early.
+	batchEmbedder, hasBatchEmbedder := idx.embedder.(embedder.BatchEmbedder)
+
+	// Both paths below hand each file off for saving as soon as that file
+	// is fully embedded (via the saver above on the batch path, directly in
+	// IndexFile on the sequential path), and checkpoint periodically -- so
+	// if embedding stops on an error or a canceled context, the stats
+	// returned still reflect everything that was actually saved, and that
+	// work is not lost even though this function is returning early.
 	var embedErr error
 	stopEmbedding := false
 
@@ -327,22 +347,22 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		log.Printf("Embedding wave %d: %d files queued for embedding", n, len(wave))
 
 		if hasBatchEmbedder {
-			indexed, chunks, err := idx.indexFilesBatched(ctx, wave, batchEmbedder, cumulativeBatchProgress(onBatchProgress), cp)
-			statsMu.Lock()
-			stats.FilesIndexed += indexed
-			stats.ChunksCreated += chunks
-			statsMu.Unlock()
-			priorChunksCompleted.Add(int64(chunks))
-			priorChunksTotal.Add(int64(chunks))
+			embedded, chunks, err := idx.indexFilesBatched(ctx, wave, batchEmbedder, progressWithCounts, saver, onFileEmbedded)
+			if err == nil {
+				// A store failure surfaces in the saver, not in the
+				// embedding call: stop starting new waves instead of
+				// embedding into a store that can no longer save.
+				err = saver.Err()
+			}
 			if err != nil {
 				embedErr = err
 				stopEmbedding = true
 				log.Printf("Embedding wave %d failed after %d files / %d chunks (%s): %v",
-					n, indexed, chunks, time.Since(waveStart).Round(time.Millisecond), err)
+					n, embedded, chunks, time.Since(waveStart).Round(time.Millisecond), err)
 				return
 			}
-			log.Printf("Embedding wave %d complete: %d files indexed, %d chunks embedded (%s)",
-				n, indexed, chunks, time.Since(waveStart).Round(time.Millisecond))
+			log.Printf("Embedding wave %d complete: %d files embedded, %d chunks queued for saving (%s)",
+				n, embedded, chunks, time.Since(waveStart).Round(time.Millisecond))
 			return
 		}
 
@@ -369,16 +389,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			waveIndexed++
 			waveChunks += chunks
 
-			cur := sequentialIndexed.Add(1)
-			if onBatchProgress != nil {
-				onBatchProgress(BatchProgressInfo{
-					BatchIndex:      int(cur) - 1,
-					TotalBatches:    int(cur),
-					CompletedChunks: int(cur),
-					TotalChunks:     int(cur),
-					Provisional:     !decideComplete.Load(),
-				})
-			}
+			onFileEmbedded()
 		}
 		log.Printf("Embedding wave %d complete: %d files indexed, %d chunks embedded (%s)",
 			n, waveIndexed, waveChunks, time.Since(waveStart).Round(time.Millisecond))
@@ -399,6 +410,17 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	}
 	flushWave(wave)
 
+	// Every embedded file has been handed to the saver by now; wait for the
+	// queued store writes to land before reporting stats, removing deleted
+	// files, or running the deferred final Persist.
+	saveErr := saver.closeAndWait()
+
+	// One final update so the bar lands exactly on 100% now that both
+	// scan/decide and embedding are done.
+	if queuedForEmbedding.Load() > 0 {
+		progressWithCounts(BatchProgressInfo{})
+	}
+
 	if decideErr != nil {
 		stats.Duration = time.Since(start)
 		return stats, decideErr
@@ -406,6 +428,10 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	if embedErr != nil {
 		stats.Duration = time.Since(start)
 		return stats, embedErr
+	}
+	if saveErr != nil {
+		stats.Duration = time.Since(start)
+		return stats, saveErr
 	}
 
 	// Remove deleted files
@@ -678,57 +704,215 @@ func createStoreChunks(chunkInfos []ChunkInfo, embeddings [][]float32, now time.
 	return chunks, chunkIDs
 }
 
-// saveFileData saves chunks and document metadata for a single file.
-func (idx *Indexer) saveFileData(ctx context.Context, fd fileChunkData, chunks []store.Chunk, chunkIDs []string) error {
-	if err := idx.store.SaveChunks(ctx, chunks); err != nil {
-		return fmt.Errorf("failed to save chunks for %s: %w", fd.file.Path, err)
-	}
+// saveQueueSize bounds how many fully-embedded files can be waiting on the
+// background saver before embedding workers start blocking on enqueue. The
+// bound keeps memory finite (each queued file holds its chunk embeddings);
+// hitting it means the store really is slower than the embedder over a
+// sustained window, and backpressure is the correct behavior then.
+const saveQueueSize = 1024
 
-	doc := store.Document{
-		Path:     fd.file.Path,
-		Hash:     fd.file.Hash,
-		ModTime:  time.Unix(fd.file.ModTime, 0),
-		ChunkIDs: chunkIDs,
-	}
+// saveCoalesceMaxChunks caps how many chunks the saver packs into a single
+// SaveChunks call when coalescing queued files. One bulk upsert covering
+// dozens of files is dramatically cheaper on remote stores (Qdrant,
+// Postgres) than one round trip per file.
+const saveCoalesceMaxChunks = 512
 
-	if err := idx.store.SaveDocument(ctx, doc); err != nil {
-		return fmt.Errorf("failed to save document for %s: %w", fd.file.Path, err)
-	}
-
-	return nil
+// saveJob carries one fully-embedded file's chunks and document metadata to
+// the background saver.
+type saveJob struct {
+	fd       fileChunkData
+	chunks   []store.Chunk
+	chunkIDs []string
 }
 
-// wrapBatchProgress creates an embedder.BatchProgress callback from BatchProgressCallback.
+// asyncSaver persists embedded files on a dedicated goroutine so embedding
+// never waits on store round trips (see the comment at its construction in
+// IndexAllWithBatchProgress). Files are saved in the order they finish
+// embedding; chunks from consecutively queued files are coalesced into bulk
+// SaveChunks calls. The first store error is retained (Err) and every
+// subsequent job is dropped unsaved -- dropped files simply are not
+// recorded as indexed, so the next run picks them up again (indexing is
+// resumable).
+type asyncSaver struct {
+	idx     *Indexer
+	cp      *checkpoint
+	onSaved func(files, chunks int)
+
+	jobs chan saveJob
+	done chan struct{}
+
+	mu  sync.Mutex
+	err error
+}
+
+func newAsyncSaver(ctx context.Context, idx *Indexer, cp *checkpoint, onSaved func(files, chunks int)) *asyncSaver {
+	s := &asyncSaver{
+		idx:     idx,
+		cp:      cp,
+		onSaved: onSaved,
+		jobs:    make(chan saveJob, saveQueueSize),
+		done:    make(chan struct{}),
+	}
+	go s.run(ctx)
+	return s
+}
+
+// enqueue hands a fully-embedded file to the saver. It blocks only when the
+// queue is full (sustained store slowness -- deliberate backpressure) or
+// the context is canceled.
+func (s *asyncSaver) enqueue(ctx context.Context, job saveJob) error {
+	select {
+	case s.jobs <- job:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Err returns the first store error encountered by the saver, if any.
+func (s *asyncSaver) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func (s *asyncSaver) setErr(err error) {
+	s.mu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.mu.Unlock()
+}
+
+// closeAndWait signals that no more jobs are coming, waits for every queued
+// job to be flushed, and returns the first store error (if any). Must be
+// called exactly once, after every enqueue caller has finished.
+func (s *asyncSaver) closeAndWait() error {
+	close(s.jobs)
+	<-s.done
+	return s.Err()
+}
+
+func (s *asyncSaver) run(ctx context.Context) {
+	defer close(s.done)
+
+	for job := range s.jobs {
+		batch := []saveJob{job}
+		chunkCount := len(job.chunks)
+
+		// Coalesce whatever is already waiting (up to a cap) into one bulk
+		// write, without blocking to wait for more work to arrive.
+	coalesce:
+		for chunkCount < saveCoalesceMaxChunks {
+			select {
+			case next, ok := <-s.jobs:
+				if !ok {
+					break coalesce
+				}
+				batch = append(batch, next)
+				chunkCount += len(next.chunks)
+			default:
+				break coalesce
+			}
+		}
+
+		s.flush(ctx, batch, chunkCount)
+	}
+}
+
+// flush writes one coalesced group: a single bulk SaveChunks covering every
+// file's chunks, then each file's document. After the first error, jobs are
+// dropped unsaved (see the asyncSaver doc comment).
+func (s *asyncSaver) flush(ctx context.Context, batch []saveJob, chunkCount int) {
+	if s.Err() != nil {
+		return
+	}
+
+	allChunks := make([]store.Chunk, 0, chunkCount)
+	for _, job := range batch {
+		allChunks = append(allChunks, job.chunks...)
+	}
+
+	if err := s.idx.store.SaveChunks(ctx, allChunks); err != nil {
+		s.setErr(fmt.Errorf("failed to save chunks: %w", err))
+		log.Printf("Saver: failed to save %d chunks across %d files: %v", chunkCount, len(batch), err)
+		return
+	}
+
+	for _, job := range batch {
+		doc := store.Document{
+			Path:     job.fd.file.Path,
+			Hash:     job.fd.file.Hash,
+			ModTime:  time.Unix(job.fd.file.ModTime, 0),
+			ChunkIDs: job.chunkIDs,
+		}
+		if err := s.idx.store.SaveDocument(ctx, doc); err != nil {
+			s.setErr(fmt.Errorf("failed to save document for %s: %w", job.fd.file.Path, err))
+			log.Printf("Saver: failed to save document for %s: %v", job.fd.file.Path, err)
+			continue
+		}
+		if s.onSaved != nil {
+			s.onSaved(1, len(job.chunks))
+		}
+		s.cp.fileSaved()
+	}
+}
+
+// wrapBatchProgress adapts the embedder's chunk-level progress callback to
+// the indexer's file-based BatchProgressInfo. Chunk-level completion no
+// longer drives the progress bar (file completion does -- see
+// onFileEmbedded in IndexAllWithBatchProgress), so only retry
+// notifications are forwarded; the receiving callback is expected to stamp
+// the current file counts onto them.
 func wrapBatchProgress(onProgress BatchProgressCallback) embedder.BatchProgress {
 	if onProgress == nil {
 		return nil
 	}
 	return func(batchIndex, totalBatches, completedChunks, totalChunks int, retrying bool, attempt int, statusCode int) {
+		if !retrying {
+			return
+		}
 		onProgress(BatchProgressInfo{
-			BatchIndex:      batchIndex,
-			TotalBatches:    totalBatches,
-			CompletedChunks: completedChunks,
-			TotalChunks:     totalChunks,
-			Retrying:        retrying,
-			Attempt:         attempt,
-			StatusCode:      statusCode,
+			BatchIndex:   batchIndex,
+			TotalBatches: totalBatches,
+			Retrying:     true,
+			Attempt:      attempt,
+			StatusCode:   statusCode,
 		})
 	}
 }
 
 // indexFilesBatched indexes multiple files using cross-file batch embedding.
 // It collects chunks from all files, forms batches, embeds them in parallel,
-// then maps results back and stores them.
+// then maps results back and hands each fully-embedded file to the
+// background saver -- it never writes to the store itself, so embedding
+// workers are never blocked on store round trips (see asyncSaver).
+//
+// onFileEmbedded (optional) is invoked once per file as soon as every chunk
+// of that file has an embedding (or the file turned out to need none), and
+// drives the file-based embed progress bar.
+//
+// The returned counts are files/chunks queued for saving; the authoritative
+// saved counts accumulate through the saver's onSaved callback.
 func (idx *Indexer) indexFilesBatched(
 	ctx context.Context,
 	files []FileInfo,
 	batchEmb embedder.BatchEmbedder,
 	onProgress BatchProgressCallback,
-	cp *checkpoint,
-) (filesIndexed int, chunksCreated int, err error) {
+	saver *asyncSaver,
+	onFileEmbedded func(),
+) (filesEmbedded int, chunksEmbedded int, err error) {
 	fileData, fileChunks, err := idx.prepareFileChunks(ctx, files)
 	if err != nil {
 		return 0, 0, err
+	}
+
+	// Files that produced no chunks still count toward embed progress:
+	// they were queued for embedding, and nothing more will happen to them.
+	if onFileEmbedded != nil {
+		for skipped := len(files) - len(fileData); skipped > 0; skipped-- {
+			onFileEmbedded()
+		}
 	}
 
 	if len(fileChunks) == 0 {
@@ -831,18 +1015,21 @@ func (idx *Indexer) indexFilesBatched(
 		log.Printf("Reused %d cached embeddings across %d files", hits, len(preFilledFiles))
 	}
 
-	// Save fully-cached files immediately.
+	// Queue fully-cached files for saving immediately -- no embedding
+	// needed; the background saver persists them while other files embed.
 	now := time.Now()
 	for _, pf := range preFilledFiles {
 		fd := fileData[pf.fdIndex]
 		idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
 		chunks, chunkIDs := createStoreChunks(fd.chunkInfos, pf.vectors, now)
-		if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
-			return filesIndexed, chunksCreated, err
+		if err := saver.enqueue(ctx, saveJob{fd: fd, chunks: chunks, chunkIDs: chunkIDs}); err != nil {
+			return filesEmbedded, chunksEmbedded, err
 		}
-		filesIndexed++
-		chunksCreated += len(chunks)
-		cp.fileSaved()
+		filesEmbedded++
+		chunksEmbedded += len(chunks)
+		if onFileEmbedded != nil {
+			onFileEmbedded()
+		}
 	}
 
 	// Embed remaining (non-cached) files. Each file's chunks+document are
@@ -877,10 +1064,10 @@ func (idx *Indexer) indexFilesBatched(
 		}
 
 		var (
-			mu          sync.Mutex
-			savedFiles  int
-			savedChunks int
-			saveErr     error
+			mu           sync.Mutex
+			queuedFiles  int
+			queuedChunks int
+			enqueueErr   error
 		)
 
 		onBatchDone := func(result embedder.BatchResult) {
@@ -927,48 +1114,57 @@ func (idx *Indexer) indexFilesBatched(
 					// Shouldn't happen (every chunk's batch reported success
 					// for remaining[pos] to reach 0), but don't save a
 					// partial/corrupt document if it somehow does -- the
-					// next run will pick this file up again.
+					// next run will pick this file up again. It still
+					// counts as progressed so the bar can reach 100%.
 					log.Printf("Warning: %s completed with missing embeddings, will retry next run", fd.file.Path)
+					if onFileEmbedded != nil {
+						onFileEmbedded()
+					}
 					continue
 				}
 
 				idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
 				chunks, chunkIDs := createStoreChunks(fd.chunkInfos, vecs, time.Now())
-				if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
+				// Hand the finished file to the background saver and move
+				// straight on: this callback runs on an embedding worker,
+				// which must not block on a store round trip.
+				if err := saver.enqueue(ctx, saveJob{fd: fd, chunks: chunks, chunkIDs: chunkIDs}); err != nil {
 					mu.Lock()
-					if saveErr == nil {
-						saveErr = err
+					if enqueueErr == nil {
+						enqueueErr = err
 					}
 					mu.Unlock()
-					log.Printf("Failed to save %s: %v", fd.file.Path, err)
+					log.Printf("Failed to queue %s for saving: %v", fd.file.Path, err)
 					continue
 				}
 
 				mu.Lock()
-				savedFiles++
-				savedChunks += len(chunks)
+				queuedFiles++
+				queuedChunks += len(chunks)
 				mu.Unlock()
-				cp.fileSaved()
+				if onFileEmbedded != nil {
+					onFileEmbedded()
+				}
 			}
 		}
 
 		_, embedErr := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress), onBatchDone)
 
 		mu.Lock()
-		filesIndexed += savedFiles
-		chunksCreated += savedChunks
-		finalSaveErr := saveErr
+		filesEmbedded += queuedFiles
+		chunksEmbedded += queuedChunks
+		finalEnqueueErr := enqueueErr
 		mu.Unlock()
 
 		if embedErr != nil {
-			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", embedErr)
+			return filesEmbedded, chunksEmbedded, fmt.Errorf("failed to embed batches: %w", embedErr)
 		}
-		if finalSaveErr != nil {
-			return filesIndexed, chunksCreated, finalSaveErr
+		if finalEnqueueErr != nil {
+			return filesEmbedded, chunksEmbedded, finalEnqueueErr
 		}
 	}
 
-	return filesIndexed, chunksCreated, nil
+	return filesEmbedded, chunksEmbedded, nil
 }
 
 // maxReChunkAttempts is the maximum number of times we'll try to re-chunk

@@ -66,9 +66,9 @@ func (m *progressModel) setSize(w int) {
 	m.width = w
 	// Calculate available width for the bar itself
 	// Label "Scan ": 5 chars
-	// Status " 100/100": approx 15 chars
+	// Status " 100% 100/100": approx 20 chars
 	// Padding: 2
-	available := w - 25
+	available := w - 30
 	if available < 10 {
 		available = 10
 	}
@@ -111,20 +111,20 @@ func (m progressModel) View() string {
 		embedPct = float64(m.embedCurrent) / float64(m.embedTotal)
 	}
 
-	scanStatus := fmt.Sprintf("%d/%d", m.scanCurrent, m.scanTotal)
-	embedStatus := fmt.Sprintf("%d/%d", m.embedCurrent, m.embedTotal)
+	scanStatus := fmt.Sprintf("%3.0f%% %d/%d", scanPct*100, m.scanCurrent, m.scanTotal)
+	embedStatus := fmt.Sprintf("%3.0f%% %d/%d", embedPct*100, m.embedCurrent, m.embedTotal)
 
 	rpgNodePct := 0.0
 	if m.rpgNodeTotal > 0 {
 		rpgNodePct = float64(m.rpgNodeCurrent) / float64(m.rpgNodeTotal)
 	}
-	rpgNodeStatus := fmt.Sprintf("%s %d/%d", m.rpgNodeStep, m.rpgNodeCurrent, m.rpgNodeTotal)
+	rpgNodeStatus := fmt.Sprintf("%s %3.0f%% %d/%d", m.rpgNodeStep, rpgNodePct*100, m.rpgNodeCurrent, m.rpgNodeTotal)
 
 	rpgEdgePct := 0.0
 	if m.rpgEdgeTotal > 0 {
 		rpgEdgePct = float64(m.rpgEdgeCurrent) / float64(m.rpgEdgeTotal)
 	}
-	rpgEdgeStatus := fmt.Sprintf("%s %d/%d", m.rpgEdgeStep, m.rpgEdgeCurrent, m.rpgEdgeTotal)
+	rpgEdgeStatus := fmt.Sprintf("%s %3.0f%% %d/%d", m.rpgEdgeStep, rpgEdgePct*100, m.rpgEdgeCurrent, m.rpgEdgeTotal)
 
 	scanView := lipgloss.JoinHorizontal(lipgloss.Center,
 		m.theme.text.Width(6).Render("Scan"),

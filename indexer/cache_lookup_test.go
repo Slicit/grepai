@@ -231,7 +231,9 @@ func TestIndexFilesBatched_CacheLookupsRunConcurrently(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		_, _, _ = idx.indexFilesBatched(context.Background(), files, mockEmb, nil, cp)
+		saver := newAsyncSaver(context.Background(), idx, cp, nil)
+		_, _, _ = idx.indexFilesBatched(context.Background(), files, mockEmb, nil, saver, nil)
+		_ = saver.closeAndWait()
 		close(done)
 	}()
 
