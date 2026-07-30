@@ -508,13 +508,22 @@ func TestGOBSymbolStore_ContentHashLifecycle(t *testing.T) {
 		},
 	}
 
-	if err := store.SaveFileWithContentHash(ctx, "main.go", "hash-1", symbols, refs); err != nil {
+	if err := store.SaveFileWithContentHash(ctx, "main.go", "hash-1", symbols, refs, 1234, 5678); err != nil {
 		t.Fatalf("SaveFileWithContentHash failed: %v", err)
 	}
 
 	hash, ok := store.GetFileContentHash("main.go")
 	if !ok || hash != "hash-1" {
 		t.Fatalf("expected hash-1 in memory, got ok=%v hash=%q", ok, hash)
+	}
+	if !store.FastSkip("main.go", 1234, 5678) {
+		t.Fatal("expected FastSkip to match the size/mtime just saved")
+	}
+	if store.FastSkip("main.go", 9999, 5678) {
+		t.Fatal("expected FastSkip to reject a mismatched size")
+	}
+	if store.FastSkip("main.go", 1234, 9999) {
+		t.Fatal("expected FastSkip to reject a mismatched mtime")
 	}
 
 	if err := store.Persist(ctx); err != nil {
@@ -533,6 +542,9 @@ func TestGOBSymbolStore_ContentHashLifecycle(t *testing.T) {
 	if !reloaded.IsFileIndexed("main.go") {
 		t.Fatal("expected file to be marked indexed")
 	}
+	if !reloaded.FastSkip("main.go", 1234, 5678) {
+		t.Fatal("expected FastSkip to still match after a reload (size/mtime survive persist)")
+	}
 
 	if err := reloaded.DeleteFile(ctx, "main.go"); err != nil {
 		t.Fatalf("DeleteFile failed: %v", err)
@@ -544,6 +556,69 @@ func TestGOBSymbolStore_ContentHashLifecycle(t *testing.T) {
 	if reloaded.IsFileIndexed("main.go") {
 		t.Fatal("expected file index marker to be removed on delete")
 	}
+	if reloaded.FastSkip("main.go", 1234, 5678) {
+		t.Fatal("expected FastSkip to reject a deleted file")
+	}
+}
+
+// TestGOBSymbolStore_FastSkipRequiresIndexedFile guards against FastSkip
+// matching on size/mtime alone: a file that was never actually indexed
+// (fileIndex[path] is false) must never be skipped, even if some fileMeta
+// entry happened to exist for that path.
+func TestGOBSymbolStore_FastSkipRequiresIndexedFile(t *testing.T) {
+	ctx := context.Background()
+	store := NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+
+	if store.FastSkip("never-seen.go", 0, 0) {
+		t.Fatal("expected FastSkip to reject a file that was never indexed")
+	}
+
+	if err := store.SaveFileWithContentHash(ctx, "seen.go", "h", nil, nil, 10, 20); err != nil {
+		t.Fatalf("SaveFileWithContentHash failed: %v", err)
+	}
+	if err := store.DeleteFile(ctx, "seen.go"); err != nil {
+		t.Fatalf("DeleteFile failed: %v", err)
+	}
+	if store.FastSkip("seen.go", 10, 20) {
+		t.Fatal("expected FastSkip to reject a file removed via DeleteFile even with matching size/mtime")
+	}
+}
+
+// TestGOBSymbolStore_RefreshFileMeta verifies RefreshFileMeta updates the
+// size/mtime FastSkip compares against without touching the stored content
+// hash or requiring symbols/refs to be re-saved, and is a no-op for a file
+// that isn't currently indexed.
+func TestGOBSymbolStore_RefreshFileMeta(t *testing.T) {
+	ctx := context.Background()
+	store := NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+
+	// No-op on an unindexed file: must not create a phantom fileMeta entry.
+	store.RefreshFileMeta("ghost.go", 1, 2)
+	if store.FastSkip("ghost.go", 1, 2) {
+		t.Fatal("expected RefreshFileMeta to be a no-op for a file that was never indexed")
+	}
+
+	if err := store.SaveFileWithContentHash(ctx, "main.go", "hash-1", nil, nil, 100, 200); err != nil {
+		t.Fatalf("SaveFileWithContentHash failed: %v", err)
+	}
+	if !store.FastSkip("main.go", 100, 200) {
+		t.Fatal("expected FastSkip to match right after SaveFileWithContentHash")
+	}
+
+	// Simulate an mtime-resetting event (checkout/rsync): mtime moves, but
+	// content -- and therefore the hash -- doesn't.
+	store.RefreshFileMeta("main.go", 100, 999)
+
+	if store.FastSkip("main.go", 100, 200) {
+		t.Fatal("expected the stale (pre-refresh) mtime to no longer match")
+	}
+	if !store.FastSkip("main.go", 100, 999) {
+		t.Fatal("expected FastSkip to match the refreshed mtime")
+	}
+	hash, ok := store.GetFileContentHash("main.go")
+	if !ok || hash != "hash-1" {
+		t.Fatalf("expected RefreshFileMeta to leave the content hash untouched, got ok=%v hash=%q", ok, hash)
+	}
 }
 
 func TestGOBSymbolStore_SaveFileClearsHashForBackwardCompatibility(t *testing.T) {
@@ -551,8 +626,11 @@ func TestGOBSymbolStore_SaveFileClearsHashForBackwardCompatibility(t *testing.T)
 	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
 
 	store := NewGOBSymbolStore(indexPath)
-	if err := store.SaveFileWithContentHash(ctx, "main.go", "hash-1", nil, nil); err != nil {
+	if err := store.SaveFileWithContentHash(ctx, "main.go", "hash-1", nil, nil, 42, 84); err != nil {
 		t.Fatalf("SaveFileWithContentHash failed: %v", err)
+	}
+	if !store.FastSkip("main.go", 42, 84) {
+		t.Fatal("expected FastSkip to match right after SaveFileWithContentHash")
 	}
 
 	if err := store.SaveFile(ctx, "main.go", nil, nil); err != nil {
@@ -561,6 +639,9 @@ func TestGOBSymbolStore_SaveFileClearsHashForBackwardCompatibility(t *testing.T)
 
 	if _, ok := store.GetFileContentHash("main.go"); ok {
 		t.Fatal("expected SaveFile without hash to clear stored hash")
+	}
+	if store.FastSkip("main.go", 42, 84) {
+		t.Fatal("expected SaveFile without hash to also clear the fileMeta FastSkip uses")
 	}
 }
 

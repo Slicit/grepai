@@ -19,13 +19,28 @@ type GOBSymbolStore struct {
 	index             *SymbolIndex
 	fileIndex         map[string]bool
 	fileContentHashes map[string]string
-	mu                sync.RWMutex
+	// fileMeta records, per file, the size and mtime last observed when its
+	// content hash was computed. FastSkip uses this to answer "has this file
+	// possibly changed?" without opening it -- see FastSkip for why that
+	// matters (avoiding a full disk read + SHA-256 for every traced file on
+	// every restart is the difference between a restart taking seconds and
+	// one taking an hour on a large repo or a slow filesystem).
+	fileMeta map[string]fileMetaRecord
+	mu       sync.RWMutex
+}
+
+// fileMetaRecord is the (size, mtime) pair FastSkip compares against to
+// decide, with zero I/O, whether a file needs to be re-read at all.
+type fileMetaRecord struct {
+	Size    int64
+	ModTime int64
 }
 
 type gobSymbolData struct {
 	Index             SymbolIndex
 	FileIndex         map[string]bool
 	FileContentHashes map[string]string
+	FileMeta          map[string]fileMetaRecord
 }
 
 // NewGOBSymbolStore creates a new GOB-based symbol store.
@@ -41,6 +56,7 @@ func NewGOBSymbolStore(indexPath string) *GOBSymbolStore {
 		},
 		fileIndex:         make(map[string]bool),
 		fileContentHashes: make(map[string]string),
+		fileMeta:          make(map[string]fileMetaRecord),
 	}
 }
 
@@ -82,6 +98,7 @@ func (s *GOBSymbolStore) loadUnlocked() error {
 	s.index = &data.Index
 	s.fileIndex = data.FileIndex
 	s.fileContentHashes = data.FileContentHashes
+	s.fileMeta = data.FileMeta
 
 	if s.index.Symbols == nil {
 		s.index.Symbols = make(map[string][]Symbol)
@@ -97,6 +114,15 @@ func (s *GOBSymbolStore) loadUnlocked() error {
 	}
 	if s.fileContentHashes == nil {
 		s.fileContentHashes = make(map[string]string)
+	}
+	// Older on-disk indexes (encoded before FileMeta existed) simply omit
+	// the field -- gob leaves it as nil rather than erroring, since decoding
+	// matches by field name and tolerates the receiving struct having a
+	// field the encoded data doesn't. Every file falls back to the existing
+	// lastIndexTime-based gate below until it's next saved, at which point
+	// FastSkip starts working for it.
+	if s.fileMeta == nil {
+		s.fileMeta = make(map[string]fileMetaRecord)
 	}
 
 	return nil
@@ -132,6 +158,7 @@ func (s *GOBSymbolStore) persistUnlocked() error {
 		Index:             *s.index,
 		FileIndex:         s.fileIndex,
 		FileContentHashes: s.fileContentHashes,
+		FileMeta:          s.fileMeta,
 	}
 
 	tmpFile, err := os.CreateTemp(filepath.Dir(s.indexPath), filepath.Base(s.indexPath)+".tmp-*")
@@ -168,12 +195,16 @@ func (s *GOBSymbolStore) persistUnlocked() error {
 
 // SaveFile persists symbols and references for a file.
 func (s *GOBSymbolStore) SaveFile(ctx context.Context, filePath string, symbols []Symbol, refs []Reference) error {
-	return s.SaveFileWithContentHash(ctx, filePath, "", symbols, refs)
+	return s.SaveFileWithContentHash(ctx, filePath, "", symbols, refs, 0, 0)
 }
 
 // SaveFileWithContentHash persists symbols/references for a file and tracks
-// the current file content hash for future cache checks.
-func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath string, contentHash string, symbols []Symbol, refs []Reference) error {
+// the current file content hash for future cache checks. size and modTime
+// are the values observed when contentHash was computed (pass 0, 0 if
+// unknown, e.g. from SaveFile below) -- they seed FastSkip so a future
+// restart can skip this file without reading it, as long as neither has
+// changed since.
+func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath string, contentHash string, symbols []Symbol, refs []Reference, size int64, modTime int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -206,8 +237,10 @@ func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath s
 	s.fileIndex[filePath] = true
 	if contentHash != "" {
 		s.fileContentHashes[filePath] = contentHash
+		s.fileMeta[filePath] = fileMetaRecord{Size: size, ModTime: modTime}
 	} else {
 		delete(s.fileContentHashes, filePath)
+		delete(s.fileMeta, filePath)
 	}
 	return nil
 }
@@ -262,6 +295,7 @@ func (s *GOBSymbolStore) deleteFileUnlocked(filePath string) {
 
 	delete(s.fileIndex, filePath)
 	delete(s.fileContentHashes, filePath)
+	delete(s.fileMeta, filePath)
 }
 
 // LookupSymbol finds symbol definitions by name.
@@ -553,4 +587,50 @@ func (s *GOBSymbolStore) GetFileContentHash(filePath string) (string, bool) {
 	defer s.mu.RUnlock()
 	hash, ok := s.fileContentHashes[filePath]
 	return hash, ok
+}
+
+// RefreshFileMeta updates the recorded (size, mtime) for an already-indexed
+// file without touching its symbols, references, or content hash. Callers
+// use this when a file was read and its content hash still matched what
+// was already stored (so nothing about its symbols changed) but its mtime
+// had drifted from what FastSkip last saw -- for example after a git
+// checkout, rsync, or bind-mount remount rewrites mtimes repo-wide without
+// touching content. Without this, such a file would keep failing FastSkip
+// and paying a real (if now-parallelized) read+hash on every subsequent
+// restart, even though its content never actually changes again. A no-op
+// if the file isn't currently indexed.
+func (s *GOBSymbolStore) RefreshFileMeta(filePath string, size, modTime int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.fileIndex[filePath] {
+		return
+	}
+	s.fileMeta[filePath] = fileMetaRecord{Size: size, ModTime: modTime}
+}
+
+// FastSkip reports whether filePath can be skipped without reading it: true
+// only when the file is already indexed and its size and modification time
+// exactly match what was recorded the last time its content hash was
+// computed (see SaveFileWithContentHash). This is a zero-I/O check -- no
+// file is opened, nothing is hashed -- so callers can use it as the very
+// first gate before anything more expensive, regardless of how large the
+// file is or how slow the filesystem is.
+//
+// This is deliberately independent of any global "last index time"
+// watermark: a single event that rewrites every file's mtime (a git
+// checkout, an rsync, a bind-mount remount) invalidates a watermark-based
+// gate for the entire repository at once, forcing a full re-read of every
+// file. Per-file size+mtime, persisted alongside the hash it was computed
+// from, survives that: as long as this exact file's size and mtime are
+// unchanged from the last time it was actually read, its content can be
+// trusted unchanged too, no matter what happened to the rest of the repo or
+// to any watermark.
+func (s *GOBSymbolStore) FastSkip(filePath string, size, modTime int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.fileIndex[filePath] {
+		return false
+	}
+	meta, ok := s.fileMeta[filePath]
+	return ok && meta.Size == size && meta.ModTime == modTime
 }
